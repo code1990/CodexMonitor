@@ -4,11 +4,13 @@ import {
   useEffect,
   useRef,
   useState,
+  type ChangeEvent,
   type ClipboardEvent,
 } from "react";
 import type {
   AppMention,
   AppOption,
+  ConversationItem,
   ComposerSendIntent,
   ComposerEditorSettings,
   CustomPromptOption,
@@ -39,11 +41,18 @@ import { useComposerDraftEffects } from "../hooks/useComposerDraftEffects";
 import { useComposerKeyDown } from "../hooks/useComposerKeyDown";
 import { useComposerSuggestionStyle } from "../hooks/useComposerSuggestionStyle";
 import { usePromptHistory } from "../hooks/usePromptHistory";
+import { useAutoTaskRunner } from "../hooks/useAutoTaskRunner";
+import { ComposerAutomationPanel } from "./ComposerAutomationPanel";
 import { ComposerInput } from "./ComposerInput";
 import { ComposerMetaBar } from "./ComposerMetaBar";
 import { ComposerQueue } from "./ComposerQueue";
 import { isMacPlatform } from "../../../utils/platformPaths";
 import type { CodexArgsOption } from "../../threads/utils/codexArgsProfiles";
+import {
+  listTextFilesInDirectory,
+  pickDirectory,
+  writeTextFile,
+} from "../../../services/tauri";
 
 type ComposerProps = {
   onSend: (
@@ -139,6 +148,10 @@ type ComposerProps = {
   onReviewPromptUpdateCustomInstructions?: (value: string) => void;
   onReviewPromptConfirmCustom?: () => Promise<void>;
   onFileAutocompleteActiveChange?: (active: boolean) => void;
+  automationScopeKey?: string | null;
+  automationConversationItems?: ConversationItem[];
+  automationWorkspaceId?: string | null;
+  automationThreadId?: string | null;
   contextActions?: {
     id: string;
     label: string;
@@ -242,12 +255,29 @@ export const Composer = memo(function Composer({
   onReviewPromptUpdateCustomInstructions,
   onReviewPromptConfirmCustom,
   onFileAutocompleteActiveChange,
+  automationScopeKey = null,
+  automationConversationItems = [],
+  automationWorkspaceId = null,
+  automationThreadId = null,
   contextActions = [],
 }: ComposerProps) {
+  const automationStorageKey = `composer-automation:${automationScopeKey ?? "global"}`;
   const [text, setText] = useState(draftText);
+  const [automationEnabled, setAutomationEnabled] = useState(false);
+  const [automationTimeoutSeconds, setAutomationTimeoutSeconds] = useState(300);
+  const [automationPauseSeconds, setAutomationPauseSeconds] = useState(1);
+  const [automationDirectorySourceName, setAutomationDirectorySourceName] = useState<string | null>(null);
+  const [automationPromptEnabled, setAutomationPromptEnabled] = useState(false);
+  const [automationPromptText, setAutomationPromptText] = useState("");
+  const [automationPromptSourceName, setAutomationPromptSourceName] = useState<string | null>(null);
+  const [automationAutoExportEnabled, setAutomationAutoExportEnabled] = useState(false);
+  const [automationDownloadDirectory, setAutomationDownloadDirectory] = useState<string | null>(null);
   const [selectionStart, setSelectionStart] = useState<number | null>(null);
   const [appMentionBindings, setAppMentionBindings] = useState<AppMentionBinding[]>([]);
   const internalRef = useRef<HTMLTextAreaElement | null>(null);
+  const automationFileInputRef = useRef<HTMLInputElement | null>(null);
+  const automationPromptFileInputRef = useRef<HTMLInputElement | null>(null);
+  const exportedAutomationTaskIdsRef = useRef<Set<string>>(new Set());
   const textareaRef = externalTextareaRef ?? internalRef;
   const editorSettings = editorSettingsProp ?? DEFAULT_EDITOR_SETTINGS;
   const isDictationBusy = dictationState !== "idle";
@@ -280,6 +310,30 @@ export const Composer = memo(function Composer({
     autoWrapPasteCodeLike,
     continueListOnShiftEnter,
   } = editorSettings;
+  const automationPromptPrefix = automationPromptEnabled
+    ? automationPromptText.trim()
+    : "";
+  const {
+    tasks: automationTasks,
+    summary: automationSummary,
+    importTasks,
+    importTasksFromText,
+    clearAutomationTasks,
+  } = useAutoTaskRunner({
+    enabled: automationEnabled,
+    isProcessing,
+    isBlocked: disabled,
+    timeoutMs: automationTimeoutSeconds * 1000,
+    pauseAfterCompletionMs: automationPauseSeconds * 1000,
+    scopeKey: automationScopeKey,
+    onDispatchTask: (taskText) =>
+      onSend(
+        automationPromptPrefix ? `${automationPromptPrefix}\n\n${taskText}` : taskText,
+        [],
+        undefined,
+        "default",
+      ),
+  });
 
   const setComposerText = useCallback(
     (next: string) => {
@@ -388,6 +442,182 @@ export const Composer = memo(function Composer({
     },
     [handleHistoryTextChange, handleTextChange],
   );
+
+  useEffect(() => {
+    if (automationSummary.hasTerminalIssue) {
+      setAutomationEnabled(false);
+    }
+  }, [automationSummary.hasTerminalIssue]);
+
+  useEffect(() => {
+    exportedAutomationTaskIdsRef.current = new Set();
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      const raw = window.localStorage.getItem(automationStorageKey);
+      if (!raw) {
+        setAutomationPromptEnabled(false);
+        setAutomationPromptText("");
+        setAutomationPromptSourceName(null);
+        setAutomationAutoExportEnabled(false);
+        setAutomationDownloadDirectory(null);
+        setAutomationTimeoutSeconds(300);
+        setAutomationPauseSeconds(1);
+        setAutomationDirectorySourceName(null);
+        return;
+      }
+      const parsed = JSON.parse(raw) as {
+        timeoutSeconds?: number;
+        pauseSeconds?: number;
+        directorySourceName?: string | null;
+        promptEnabled?: boolean;
+        promptText?: string;
+        promptSourceName?: string | null;
+        autoExportEnabled?: boolean;
+        downloadDirectory?: string | null;
+      };
+      setAutomationTimeoutSeconds(Math.max(5, parsed.timeoutSeconds ?? 300));
+      setAutomationPauseSeconds(Math.max(0, parsed.pauseSeconds ?? 1));
+      setAutomationDirectorySourceName(parsed.directorySourceName ?? null);
+      setAutomationPromptEnabled(Boolean(parsed.promptEnabled));
+      setAutomationPromptText(parsed.promptText ?? "");
+      setAutomationPromptSourceName(parsed.promptSourceName ?? null);
+      setAutomationAutoExportEnabled(Boolean(parsed.autoExportEnabled));
+      setAutomationDownloadDirectory(parsed.downloadDirectory ?? null);
+    } catch {
+      // Ignore invalid local state and fall back to defaults.
+    }
+  }, [automationStorageKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const payload = {
+      timeoutSeconds: automationTimeoutSeconds,
+      pauseSeconds: automationPauseSeconds,
+      directorySourceName: automationDirectorySourceName,
+      promptEnabled: automationPromptEnabled,
+      promptText: automationPromptText,
+      promptSourceName: automationPromptSourceName,
+      autoExportEnabled: automationAutoExportEnabled,
+      downloadDirectory: automationDownloadDirectory,
+    };
+    window.localStorage.setItem(automationStorageKey, JSON.stringify(payload));
+  }, [
+    automationAutoExportEnabled,
+    automationDownloadDirectory,
+    automationPromptEnabled,
+    automationPromptSourceName,
+    automationPromptText,
+    automationPauseSeconds,
+    automationDirectorySourceName,
+    automationStorageKey,
+    automationTimeoutSeconds,
+  ]);
+
+  const handleAutomationFileChange = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      if (!file) {
+        return;
+      }
+      const content = await file.text();
+      importTasksFromText(file.name, content);
+      event.target.value = "";
+    },
+    [importTasksFromText],
+  );
+
+  const handleAutomationPromptFileChange = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      if (!file) {
+        return;
+      }
+      const content = await file.text();
+      setAutomationPromptText(content.trim());
+      setAutomationPromptSourceName(file.name);
+      setAutomationPromptEnabled(content.trim().length > 0);
+      event.target.value = "";
+    },
+    [],
+  );
+
+  const handleAutomationDirectoryPick = useCallback(async () => {
+    const directory = await pickDirectory("Select markdown task folder");
+    if (!directory) {
+      return;
+    }
+    const filesInDirectory = await listTextFilesInDirectory(directory, ["md"]);
+    const directorySegments = directory.split(/[\\/]/).filter(Boolean);
+    importTasks(
+      directorySegments[directorySegments.length - 1] ?? directory,
+      filesInDirectory.map((entry, index) => ({
+        lineNumber: index + 1,
+        text: entry.content.trim(),
+        sourceFileName: entry.name,
+        sourcePath: entry.path,
+        exportFileName: entry.name,
+      })),
+    );
+    setAutomationEnabled(false);
+    setAutomationDirectorySourceName(directory);
+  }, [importTasks]);
+
+  const handleClearAutomation = useCallback(() => {
+    setAutomationEnabled(false);
+    clearAutomationTasks();
+    exportedAutomationTaskIdsRef.current = new Set();
+    setAutomationDirectorySourceName(null);
+  }, [clearAutomationTasks]);
+
+  const getLastAssistantMessage = useCallback((items: ConversationItem[]) => {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item?.kind === "message" && item.role === "assistant") {
+        return item.text.trim();
+      }
+    }
+    return "";
+  }, []);
+
+  useEffect(() => {
+    if (!automationAutoExportEnabled || !automationDownloadDirectory) {
+      return;
+    }
+    const completedTask = automationTasks.find(
+      (task) =>
+        task.status === "completed" &&
+        !exportedAutomationTaskIdsRef.current.has(task.id),
+    );
+    if (!completedTask) {
+      return;
+    }
+
+    const assistantContent = getLastAssistantMessage(automationConversationItems);
+    if (!assistantContent) {
+      return;
+    }
+    exportedAutomationTaskIdsRef.current.add(completedTask.id);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const safeWorkspace = (automationWorkspaceId ?? "workspace").replace(/[^\w-]/g, "_");
+    const safeThread = (automationThreadId ?? "thread").replace(/[^\w-]/g, "_");
+    const fileName =
+      completedTask.exportFileName?.trim() ||
+      `${timestamp}-${safeWorkspace}-${safeThread}-task-${completedTask.lineNumber}.md`;
+    const path = `${automationDownloadDirectory.replace(/[\\/]+$/, "")}/${fileName}`;
+    void writeTextFile(path, assistantContent);
+  }, [
+    automationAutoExportEnabled,
+    automationConversationItems,
+    automationDownloadDirectory,
+    automationTasks,
+    automationThreadId,
+    automationWorkspaceId,
+    getLastAssistantMessage,
+  ]);
 
   const handleSend = useCallback((submitIntent: ComposerSendIntent = "default") => {
     if (disabled) {
@@ -572,10 +802,46 @@ export const Composer = memo(function Composer({
     textareaRef,
     tryExpandFence,
   });
-
-
   return (
     <footer className={`composer${disabled ? " is-disabled" : ""}`}>
+      <ComposerAutomationPanel
+        enabled={automationEnabled}
+        busy={isProcessing}
+        blocked={disabled}
+        timeoutSeconds={automationTimeoutSeconds}
+        pauseSeconds={automationPauseSeconds}
+        sourceName={automationSummary.sourceName}
+        directorySourceName={automationDirectorySourceName}
+        promptSourceName={automationPromptSourceName}
+        promptEnabled={automationPromptEnabled}
+        autoExportEnabled={automationAutoExportEnabled}
+        downloadDirectory={automationDownloadDirectory}
+        tasks={automationTasks}
+        summary={automationSummary}
+        fileInputRef={automationFileInputRef}
+        promptFileInputRef={automationPromptFileInputRef}
+        onToggleEnabled={setAutomationEnabled}
+        onTogglePromptEnabled={setAutomationPromptEnabled}
+        onToggleAutoExportEnabled={setAutomationAutoExportEnabled}
+        onOpenFilePicker={() => automationFileInputRef.current?.click()}
+        onOpenDirectoryPicker={() => {
+          void handleAutomationDirectoryPick();
+        }}
+        onOpenPromptFilePicker={() => automationPromptFileInputRef.current?.click()}
+        onPickDownloadDirectory={async () => {
+          const selection = await pickDirectory("Select automation export folder");
+          if (selection) {
+            setAutomationDownloadDirectory(selection);
+          }
+        }}
+        onFileChange={handleAutomationFileChange}
+        onPromptFileChange={handleAutomationPromptFileChange}
+        onClear={handleClearAutomation}
+        onTimeoutSecondsChange={(value) => {
+          setAutomationTimeoutSeconds(Math.max(5, value));
+        }}
+        onPauseSecondsChange={setAutomationPauseSeconds}
+      />
       <ComposerQueue
         queuedMessages={queuedMessages}
         pausedReason={queuePausedReason}

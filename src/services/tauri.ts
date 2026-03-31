@@ -53,6 +53,14 @@ export async function pickWorkspacePaths(): Promise<string[]> {
   return Array.isArray(selection) ? selection : [selection];
 }
 
+export async function pickDirectory(title = "Select folder"): Promise<string | null> {
+  const selection = await open({ directory: true, multiple: false, title });
+  if (!selection || Array.isArray(selection)) {
+    return null;
+  }
+  return selection;
+}
+
 export async function pickImageFiles(): Promise<string[]> {
   const selection = await open({
     multiple: true,
@@ -99,6 +107,27 @@ export async function exportMarkdownFile(
   }
   await invoke("write_text_file", { path: selection, content });
   return selection;
+}
+
+export async function writeTextFile(path: string, content: string): Promise<void> {
+  await invoke("write_text_file", { path, content });
+}
+
+export async function readTextFile(path: string): Promise<string> {
+  return invoke("read_text_file", { path });
+}
+
+export type DirectoryTextFileEntry = {
+  name: string;
+  path: string;
+  content: string;
+};
+
+export async function listTextFilesInDirectory(
+  directory: string,
+  extensions: string[],
+): Promise<DirectoryTextFileEntry[]> {
+  return invoke("list_text_files_in_directory", { directory, extensions });
 }
 
 export async function listWorkspaces(): Promise<WorkspaceInfo[]> {

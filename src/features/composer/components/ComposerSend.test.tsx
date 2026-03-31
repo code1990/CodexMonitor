@@ -1,5 +1,5 @@
 /** @vitest-environment jsdom */
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useRef, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMobilePlatform } from "../../../utils/platformPaths";
@@ -279,5 +279,38 @@ describe("Composer send triggers", () => {
     fireEvent.keyDown(textarea, { key: "Tab" });
 
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("imports txt tasks and auto-dispatches the first line when enabled", async () => {
+    const onSend = vi.fn();
+    const { container } = render(<ComposerHarness onSend={onSend} />);
+
+    const fileInput = container.querySelector(
+      ".composer-automation-file",
+    ) as HTMLInputElement | null;
+    expect(fileInput).toBeTruthy();
+
+    const file = new File(["task one\ntask two"], "tasks.txt", {
+      type: "text/plain",
+    });
+    Object.defineProperty(file, "text", {
+      value: vi.fn().mockResolvedValue("task one\ntask two"),
+    });
+
+    await act(async () => {
+      fireEvent.change(fileInput!, {
+        target: {
+          files: [file],
+        },
+      });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Auto"));
+    });
+
+    expect(await screen.findByText("task one")).toBeTruthy();
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("task one", [], undefined, "default");
   });
 });

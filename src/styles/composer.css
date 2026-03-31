@@ -913,7 +913,168 @@
   color: var(--text-strong);
 }
 
+.composer-automation {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 16px;
+  border: 1px solid var(--cm-border-emphasis);
+  background: var(--cm-surface-panel);
+}
+
+.composer-automation-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.composer-automation-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.composer-automation-toggle input {
+  margin: 0;
+}
+
+.composer-automation-timeout {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.composer-automation-timeout input {
+  width: 88px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  border: 1px solid var(--cm-border-strong);
+  background: var(--cm-surface-panel-solid);
+  color: var(--text-strong);
+}
+
+.composer-automation-summary {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-subtle);
+}
+
+.composer-automation-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.composer-automation-paths {
+  display: grid;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.composer-automation-file {
+  display: none;
+}
+
+.composer-automation-table-wrap {
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: 260px;
+  border: 1px solid var(--cm-border-subtle, var(--border-subtle));
+  border-radius: 12px;
+}
+
+.composer-automation-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.composer-automation-table th,
+.composer-automation-table td {
+  padding: 8px 10px;
+  border-top: 1px solid var(--cm-border-subtle, var(--border-subtle));
+  text-align: left;
+  vertical-align: top;
+}
+
+.composer-automation-table th {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-fainter);
+}
+
+.composer-automation-task,
+.composer-automation-info {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.composer-automation-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  border: 1px solid transparent;
+}
+
+.composer-automation-badge.is-pending {
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--text-muted) 12%, transparent);
+}
+
+.composer-automation-badge.is-dispatching {
+  color: #8ab4ff;
+  background: rgba(138, 180, 255, 0.14);
+  border-color: rgba(138, 180, 255, 0.28);
+}
+
+.composer-automation-badge.is-running {
+  color: #78ebbe;
+  background: rgba(120, 235, 190, 0.14);
+  border-color: rgba(120, 235, 190, 0.28);
+}
+
+.composer-automation-badge.is-completed {
+  color: #8fd98f;
+  background: rgba(143, 217, 143, 0.14);
+  border-color: rgba(143, 217, 143, 0.28);
+}
+
+.composer-automation-badge.is-failed,
+.composer-automation-badge.is-timed_out {
+  color: #ff9a9a;
+  background: rgba(255, 120, 120, 0.14);
+  border-color: rgba(255, 120, 120, 0.28);
+}
+
 @media (max-width: 720px) {
+  .app.layout-phone .composer-automation-bar {
+    align-items: stretch;
+  }
+
+  .app.layout-phone .composer-automation-timeout {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .app.layout-phone .composer-automation-flags {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .app.layout-phone .composer-automation-timeout input {
+    width: 96px;
+  }
+
   .app.layout-phone .composer-input {
     display: block;
   }
