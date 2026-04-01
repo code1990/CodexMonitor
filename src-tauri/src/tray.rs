@@ -4,19 +4,21 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tauri::image::Image;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tauri::menu::{IsMenuItem, Menu, MenuEvent, MenuItemBuilder, PredefinedMenuItem, Submenu};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tauri::tray::TrayIconBuilder;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tauri::{Emitter, Manager, Runtime};
 
 const RECENT_THREADS_SECTION_LIMIT: usize = 3;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const TRAY_ID: &str = "codex-monitor-tray";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const TRAY_SHOW_ID: &str = "tray_show";
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const TRAY_QUIT_ID: &str = "tray_quit";
 #[cfg(target_os = "macos")]
 const TRAY_RECENT_HEADER_ID: &str = "tray_recent_header";
@@ -129,7 +131,28 @@ pub(crate) fn initialize<R: Runtime>(
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub(crate) fn initialize<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    _state: &TrayState,
+) -> tauri::Result<()> {
+    let menu = Menu::new(app)?;
+    let show_item = MenuItemBuilder::with_id(TRAY_SHOW_ID, "Show").build(app)?;
+    let quit_item = MenuItemBuilder::with_id(TRAY_QUIT_ID, "Quit").build(app)?;
+    menu.append(&show_item)?;
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&quit_item)?;
+    TrayIconBuilder::with_id(TRAY_ID)
+        .menu(&menu)
+        .tooltip("Codex Monitor")
+        .show_menu_on_left_click(true)
+        .icon(load_tray_icon()?)
+        .on_menu_event(handle_tray_menu_event::<R>)
+        .build(app)?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(crate) fn initialize<R: tauri::Runtime>(
     _app: &tauri::AppHandle<R>,
     _state: &TrayState,
@@ -321,6 +344,14 @@ fn update_tray_menu<R: Runtime>(
     tray.set_menu(Some(menu)).map_err(|error| error.to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn update_tray_menu<R: Runtime>(
+    _app: &tauri::AppHandle<R>,
+    _state: &TrayState,
+) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn build_tray_menu<R: Runtime>(
     app: &tauri::AppHandle<R>,
@@ -453,10 +484,14 @@ fn build_usage_menu_labels(usage: Option<&TraySessionUsage>) -> (String, String,
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn handle_tray_menu_event<R: Runtime>(app: &tauri::AppHandle<R>, event: MenuEvent) {
     match event.id().as_ref() {
+        TRAY_SHOW_ID => show_main_window(app),
         TRAY_QUIT_ID => app.exit(0),
+        #[cfg(target_os = "windows")]
+        _ => {}
+        #[cfg(target_os = "macos")]
         id => {
             let state = app.state::<TrayState>();
             let payload = state
@@ -472,9 +507,11 @@ fn handle_tray_menu_event<R: Runtime>(app: &tauri::AppHandle<R>, event: MenuEven
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn show_main_window<R: Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
+        #[cfg(target_os = "windows")]
+        let _ = window.set_skip_taskbar(false);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -490,7 +527,7 @@ fn emit_open_thread_event<R: Runtime>(app: &tauri::AppHandle<R>, payload: TrayOp
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn load_tray_icon() -> tauri::Result<Image<'static>> {
     Image::from_bytes(include_bytes!("../icons/tray-icon.png")).map(|image| image.to_owned())
 }
