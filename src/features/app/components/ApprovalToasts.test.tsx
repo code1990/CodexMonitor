@@ -57,4 +57,37 @@ describe("ApprovalToasts", () => {
     expect(onDecision).not.toHaveBeenCalled();
     document.body.removeChild(input);
   });
+
+  it("auto-accepts the primary request after 5 seconds", () => {
+    vi.useFakeTimers();
+    const onDecision = vi.fn();
+    render(
+      <ApprovalToasts approvals={approvals} workspaces={workspaces} onDecision={onDecision} />,
+    );
+
+    vi.advanceTimersByTime(5000);
+
+    expect(onDecision).toHaveBeenCalledWith(approvals[1], "accept");
+    vi.useRealTimers();
+  });
+
+  it("auto-remembers command approvals before accepting", () => {
+    vi.useFakeTimers();
+    const onDecision = vi.fn();
+    const onRemember = vi.fn();
+    render(
+      <ApprovalToasts
+        approvals={approvals}
+        workspaces={workspaces}
+        onDecision={onDecision}
+        onRemember={onRemember}
+      />,
+    );
+
+    vi.advanceTimersByTime(5000);
+
+    expect(onRemember).toHaveBeenCalledWith(approvals[1], ["echo", "two"]);
+    expect(onDecision).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
 });
