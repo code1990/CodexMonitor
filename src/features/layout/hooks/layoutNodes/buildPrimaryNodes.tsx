@@ -9,6 +9,7 @@ import { ErrorToasts } from "../../../notifications/components/ErrorToasts";
 import { Composer } from "../../../composer/components/Composer";
 import { TabBar } from "../../../app/components/TabBar";
 import { TabletNav } from "../../../app/components/TabletNav";
+import { RuntimeTabBar } from "../../../app/components/RuntimeTabBar";
 import type {
   LayoutNodesResult,
   LayoutPrimarySurface,
@@ -19,6 +20,7 @@ export type PrimaryLayoutNodesOptions = LayoutPrimarySurface;
 type PrimaryLayoutNodes = Pick<
   LayoutNodesResult,
   | "sidebarNode"
+  | "runtimeTabsNode"
   | "messagesNode"
   | "composerNode"
   | "approvalToastsNode"
@@ -33,6 +35,10 @@ type PrimaryLayoutNodes = Pick<
 
 export function buildPrimaryNodes(options: PrimaryLayoutNodesOptions): PrimaryLayoutNodes {
   const sidebarNode = <Sidebar {...options.sidebarProps} />;
+
+  const runtimeTabsNode = options.runtimeTabsProps ? (
+    <RuntimeTabBar {...options.runtimeTabsProps} />
+  ) : null;
 
   const messagesNode = <Messages {...options.messagesProps} />;
 
@@ -73,6 +79,7 @@ export function buildPrimaryNodes(options: PrimaryLayoutNodesOptions): PrimaryLa
 
   return {
     sidebarNode,
+    runtimeTabsNode,
     messagesNode,
     composerNode,
     approvalToastsNode,

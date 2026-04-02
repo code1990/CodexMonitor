@@ -32,7 +32,7 @@ type UseAutoTaskRunnerOptions = {
   onDispatchTask: (text: string) => void | Promise<void>;
 };
 
-type AutoTaskSummary = {
+export type AutoTaskSummary = {
   sourceName: string | null;
   total: number;
   pending: number;

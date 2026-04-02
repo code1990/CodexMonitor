@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 
 type ChatPaneProps = {
+  topNode?: ReactNode;
   messagesNode: ReactNode;
   composerNode: ReactNode;
   className?: string;
 };
 
-export function ChatPane({ messagesNode, composerNode, className }: ChatPaneProps) {
+export function ChatPane({ topNode = null, messagesNode, composerNode, className }: ChatPaneProps) {
   const composerRef = useRef<HTMLDivElement | null>(null);
   const [composerHeight, setComposerHeight] = useState(0);
 
@@ -47,6 +48,7 @@ export function ChatPane({ messagesNode, composerNode, className }: ChatPaneProp
 
   return (
     <div className={`chat-pane${className ? ` ${className}` : ""}`} style={paneStyle}>
+      {topNode ? <div className="chat-pane-top">{topNode}</div> : null}
       <div className="chat-pane-messages">{messagesNode}</div>
       {composerNode ? (
         <div className="chat-pane-composer" ref={composerRef}>

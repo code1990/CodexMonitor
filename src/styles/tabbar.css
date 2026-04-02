@@ -72,3 +72,116 @@ html[data-mobile-composer-focus="true"] .app.layout-phone .tabbar {
   width: 18px;
   height: 18px;
 }
+
+.runtime-tabbar {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+  overflow-x: auto;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-topbar) 92%, transparent), transparent),
+    var(--surface-elevated, var(--surface-topbar));
+  -webkit-app-region: no-drag;
+}
+
+.runtime-tabbar::-webkit-scrollbar {
+  height: 8px;
+}
+
+.runtime-tabbar::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-subtle) 24%, transparent);
+  border-radius: 999px;
+}
+
+.runtime-tab {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 240px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: var(--surface-panel, var(--surface-topbar));
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.04);
+  flex: 0 0 auto;
+}
+
+.runtime-tab.is-active {
+  border-color: var(--border-accent-soft);
+  background: color-mix(in srgb, var(--surface-control-hover) 78%, white 22%);
+  box-shadow: 0 0 0 1px rgba(100, 200, 255, 0.18);
+}
+
+.runtime-tab-trigger {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 8px 10px 8px 12px;
+  cursor: pointer;
+}
+
+.runtime-tab-title-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.runtime-tab-title {
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.runtime-tab-subtitle {
+  max-width: 160px;
+  font-size: 11px;
+  color: var(--text-subtle);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.runtime-tab-status {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--accent-primary, #5aa2ff);
+  box-shadow: 0 0 0 4px rgba(90, 162, 255, 0.12);
+  flex: 0 0 auto;
+}
+
+.runtime-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  margin: 0 6px 0 0;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-subtle);
+  cursor: pointer;
+}
+
+.runtime-tab-close:hover {
+  background: var(--surface-hover);
+  color: var(--text-stronger);
+}
+
+.runtime-tab-close-icon {
+  width: 14px;
+  height: 14px;
+}

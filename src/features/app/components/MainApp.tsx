@@ -67,6 +67,7 @@ import { useTrayRecentThreads } from "@app/hooks/useTrayRecentThreads";
 import { useTraySessionUsage } from "@app/hooks/useTraySessionUsage";
 import { useTauriEvent } from "@app/hooks/useTauriEvent";
 import { useAppBootstrapOrchestration } from "@app/bootstrap/useAppBootstrapOrchestration";
+import { useRuntimeRegistry } from "@app/hooks/useRuntimeRegistry";
 import {
   useThreadCodexBootstrapOrchestration,
   useThreadCodexSyncOrchestration,
@@ -78,6 +79,10 @@ import {
   useWorkspaceOrderingOrchestration,
 } from "@app/orchestration/useWorkspaceOrchestration";
 import { useAppShellOrchestration } from "@app/orchestration/useLayoutOrchestration";
+import { useRuntimeTabManager } from "@app/hooks/useRuntimeTabManager";
+import { useRuntimeNavigation } from "@app/hooks/useRuntimeNavigation";
+import { RuntimeAutomationBridge } from "@app/components/RuntimeAutomationBridge";
+import type { RuntimeAutomationController } from "@app/runtime/runtimeHost";
 import { normalizeCodexArgsInput } from "@/utils/codexArgsInput";
 import { subscribeTrayOpenThread } from "@services/events";
 
@@ -429,6 +434,7 @@ export default function MainApp() {
     hasLocalThreadSnapshot,
     activeThreadId,
     activeItems,
+    itemsByThread,
     approvals,
     userInputRequests,
     threadsByWorkspace,
@@ -1093,6 +1099,16 @@ export default function MainApp() {
   const hasActivePlan = Boolean(
     activePlan && (activePlan.steps.length > 0 || activePlan.explanation)
   );
+  const runtimeRegistry = useRuntimeRegistry();
+  const runtimeNavigation = useRuntimeNavigation({
+    registry: runtimeRegistry,
+    clearDraftState,
+    startNewAgentDraft,
+    selectWorkspace,
+    setActiveThreadId,
+    isCompact,
+    setActiveTab,
+  });
   const composerWorkspaceState = useMainAppComposerWorkspaceState({
     view: {
       activeTab,
@@ -1252,20 +1268,19 @@ export default function MainApp() {
     handleDragLeave: handleWorkspaceDragLeave,
     handleDrop: handleWorkspaceDrop,
   } = useMainAppWorkspaceActions({
-    workspaceActions: {
-      isCompact,
-      addWorkspace,
-      addWorkspaceFromPath,
-      addWorkspaceFromGitUrl,
+      workspaceActions: {
+        isCompact,
+        addWorkspace,
+        addWorkspaceFromPath,
+        addWorkspaceFromGitUrl,
       addWorkspacesFromPaths,
-      setActiveThreadId,
-      setActiveTab,
-      exitDiffView,
-      selectWorkspace,
-      onStartNewAgentDraft: startNewAgentDraft,
-      openWorktreePrompt: modalActions.openWorktreePrompt,
-      openClonePrompt: modalActions.openClonePrompt,
-      composerInputRef,
+        setActiveThreadId,
+        setActiveTab,
+        exitDiffView,
+        openDraftRuntime: runtimeNavigation.openDraftRuntime,
+        openWorktreePrompt: modalActions.openWorktreePrompt,
+        openClonePrompt: modalActions.openClonePrompt,
+        composerInputRef,
       onDebug: addDebugEntry,
     },
   });
@@ -1344,13 +1359,88 @@ export default function MainApp() {
     clearDraftForThread,
     removeImagesForThread,
   });
+  const [runtimeAutomationControllers, setRuntimeAutomationControllers] = useState<
+    Record<string, RuntimeAutomationController>
+  >({});
+  const handleRuntimeAutomationControllerChange = useCallback(
+    (runtimeId: string, controller: RuntimeAutomationController | null) => {
+      setRuntimeAutomationControllers((current) => {
+        if (!controller) {
+          if (!(runtimeId in current)) {
+            return current;
+          }
+          const next = { ...current };
+          delete next[runtimeId];
+          return next;
+        }
+        return {
+          ...current,
+          [runtimeId]: controller,
+        };
+      });
+    },
+    [],
+  );
+  const handleDispatchRuntimeTask = useCallback(
+    async (runtimeId: string, text: string) => {
+      const runtime = runtimeRegistry.runtimesById[runtimeId];
+      if (!runtime) {
+        throw new Error("Runtime not found.");
+      }
+      const workspace = workspacesById.get(runtime.workspaceId);
+      if (!workspace) {
+        throw new Error("Workspace not found.");
+      }
+      if (!workspace.connected) {
+        await connectWorkspace(workspace);
+      }
+      let targetThreadId = runtime.threadId;
+      if (!targetThreadId) {
+        targetThreadId = await startThreadForWorkspace(runtime.workspaceId, {
+          activate: false,
+        });
+        if (!targetThreadId) {
+          throw new Error("Failed to create thread for runtime.");
+        }
+        runtimeRegistry.updateRuntime(runtimeId, {
+          threadId: targetThreadId,
+        });
+      }
+      await sendUserMessageToThread(workspace, targetThreadId, text, []);
+    },
+    [
+      connectWorkspace,
+      runtimeRegistry,
+      sendUserMessageToThread,
+      startThreadForWorkspace,
+      workspacesById,
+    ],
+  );
+  const activeRuntimeController =
+    (runtimeRegistry.activeRuntimeId
+      ? runtimeAutomationControllers[runtimeRegistry.activeRuntimeId] ?? null
+      : null) ?? null;
+  const runtimeHost = {
+    runtimeId: runtimeRegistry.activeRuntimeId,
+    runtime: runtimeRegistry.activeRuntime,
+    automation: activeRuntimeController,
+  };
+  const runtimeTabManager = useRuntimeTabManager({
+    registry: runtimeRegistry,
+    workspacesById,
+    threadsByWorkspace,
+    selectWorkspace,
+    setActiveThreadId,
+    clearDraftState,
+    isCompact,
+    setActiveTab,
+  });
 
   const handleOpenThreadLinkFromExternal = useCallback(
     (workspaceId: string, threadId: string) => {
-      setActiveTab("codex");
-      handleOpenThreadLink(threadId, workspaceId);
+      runtimeNavigation.openThreadRuntime(workspaceId, threadId);
     },
-    [handleOpenThreadLink, setActiveTab],
+    [runtimeNavigation],
   );
 
   const { recordPendingThreadLink, openThreadLinkOrQueue } =
@@ -1426,6 +1516,8 @@ export default function MainApp() {
       exitDiffView,
       selectWorkspace,
       setActiveThreadId,
+      openDraftRuntime: runtimeNavigation.openDraftRuntime,
+      openThreadRuntime: runtimeNavigation.openThreadRuntime,
       connectWorkspace,
       isCompact,
       setActiveTab,
@@ -1645,6 +1737,8 @@ export default function MainApp() {
     gitState,
     selectedServiceTier: selectedServiceTier ?? null,
     composerWorkspaceState,
+    runtimeHost,
+    runtimeTabManager,
     promptActions,
     worktreeState,
     sidebarHandlers: sidebarMenuOrchestration,
@@ -1793,6 +1887,7 @@ export default function MainApp() {
     desktopTopbarLeftNode,
     tabletNavNode,
     tabBarNode,
+    runtimeTabsNode,
     gitDiffPanelNode,
     gitDiffViewerNode,
     planPanelNode,
@@ -1845,6 +1940,7 @@ export default function MainApp() {
       hasActivePlan: hasActivePlan,
       activeWorkspace: Boolean(activeWorkspace),
       sidebarNode,
+      runtimeTabsNode,
       messagesNode: mainMessagesNode,
       composerNode,
       approvalToastsNode,
@@ -1877,5 +1973,28 @@ export default function MainApp() {
     },
   });
 
-  return <MainAppShell {...mainAppShellProps} />;
+  return (
+    <>
+      {runtimeRegistry.runtimes.map((runtime) => (
+        <RuntimeAutomationBridge
+          key={runtime.id}
+          runtime={runtime}
+          registry={runtimeRegistry}
+          workspacesById={workspacesById}
+          items={runtime.threadId ? itemsByThread[runtime.threadId] ?? [] : []}
+          isProcessing={
+            runtime.threadId
+              ? threadStatusById[runtime.threadId]?.isProcessing ?? false
+              : false
+          }
+          isBlocked={runtime.threadId ? threadStatusById[runtime.threadId]?.isReviewing ?? false : false}
+          timeoutMs={300_000}
+          pauseAfterCompletionMs={1_000}
+          onDispatchTask={handleDispatchRuntimeTask}
+          onControllerChange={handleRuntimeAutomationControllerChange}
+        />
+      ))}
+      <MainAppShell {...mainAppShellProps} />
+    </>
+  );
 }

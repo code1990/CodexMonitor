@@ -13,6 +13,8 @@ type UseSidebarLayoutActionsOptions = {
   exitDiffView: () => void;
   selectWorkspace: (workspaceId: string) => void;
   setActiveThreadId: (threadId: string | null, workspaceId?: string) => void;
+  openDraftRuntime: (workspaceId: string) => void;
+  openThreadRuntime: (workspaceId: string, threadId: string) => void;
   connectWorkspace: (workspace: WorkspaceInfo) => Promise<void>;
   isCompact: boolean;
   setActiveTab: (tab: AppTab) => void;
@@ -41,6 +43,8 @@ export function useSidebarLayoutActions({
   exitDiffView,
   selectWorkspace,
   setActiveThreadId,
+  openDraftRuntime,
+  openThreadRuntime,
   connectWorkspace,
   isCompact,
   setActiveTab,
@@ -110,17 +114,18 @@ export function useSidebarLayoutActions({
     (workspaceId: string, threadId: string) => {
       exitDiffView();
       resetPullRequestSelection();
-      clearDraftState();
-      selectWorkspace(workspaceId);
-      setActiveThreadId(threadId, workspaceId);
+      openThreadRuntime(workspaceId, threadId);
     },
-    [
-      clearDraftState,
-      exitDiffView,
-      resetPullRequestSelection,
-      selectWorkspace,
-      setActiveThreadId,
-    ],
+    [exitDiffView, openThreadRuntime, resetPullRequestSelection],
+  );
+
+  const onSelectDraftAgent = useCallback(
+    (workspaceId: string) => {
+      exitDiffView();
+      resetPullRequestSelection();
+      openDraftRuntime(workspaceId);
+    },
+    [exitDiffView, openDraftRuntime, resetPullRequestSelection],
   );
 
   const onDeleteThread = useCallback(
@@ -188,6 +193,7 @@ export function useSidebarLayoutActions({
     onSelectWorkspace,
     onConnectWorkspace,
     onToggleWorkspaceCollapse,
+    onSelectDraftAgent,
     onSelectThread,
     onDeleteThread,
     onSyncThread,

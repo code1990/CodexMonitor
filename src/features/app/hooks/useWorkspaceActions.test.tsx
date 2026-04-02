@@ -28,7 +28,7 @@ describe("useWorkspaceActions telemetry", () => {
 
   it("records agent_created exactly once when adding an agent", async () => {
     const setActiveThreadId = vi.fn();
-    const startNewAgentDraft = vi.fn();
+    const openDraftRuntime = vi.fn();
 
     const { result } = renderHook(() =>
       useWorkspaceActions({
@@ -40,8 +40,7 @@ describe("useWorkspaceActions telemetry", () => {
         setActiveThreadId,
         setActiveTab: vi.fn(),
         exitDiffView: vi.fn(),
-        selectWorkspace: vi.fn(),
-        onStartNewAgentDraft: startNewAgentDraft,
+        openDraftRuntime,
         openWorktreePrompt: vi.fn(),
         openClonePrompt: vi.fn(),
         composerInputRef: { current: null },
@@ -53,8 +52,8 @@ describe("useWorkspaceActions telemetry", () => {
       await result.current.handleAddAgent(workspace);
     });
 
-    expect(setActiveThreadId).toHaveBeenCalledWith(null, "ws-1");
-    expect(startNewAgentDraft).toHaveBeenCalledWith("ws-1");
+    expect(openDraftRuntime).toHaveBeenCalledWith("ws-1");
+    expect(setActiveThreadId).not.toHaveBeenCalled();
     expect(Sentry.metrics.count).toHaveBeenCalledTimes(1);
     expect(Sentry.metrics.count).toHaveBeenCalledWith("agent_created", 1, {
       attributes: {

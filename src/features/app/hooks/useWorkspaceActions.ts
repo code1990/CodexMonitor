@@ -16,8 +16,7 @@ type Params = {
   setActiveThreadId: (threadId: string | null, workspaceId: string) => void;
   setActiveTab: (tab: "home" | "projects" | "codex" | "git" | "log") => void;
   exitDiffView: () => void;
-  selectWorkspace: (workspaceId: string) => void;
-  onStartNewAgentDraft: (workspaceId: string) => void;
+  openDraftRuntime: (workspaceId: string) => void;
   openWorktreePrompt: (workspace: WorkspaceInfo) => void;
   openClonePrompt: (workspace: WorkspaceInfo) => void;
   composerInputRef: RefObject<HTMLTextAreaElement | null>;
@@ -33,8 +32,7 @@ export function useWorkspaceActions({
   setActiveThreadId,
   setActiveTab,
   exitDiffView,
-  selectWorkspace,
-  onStartNewAgentDraft,
+  openDraftRuntime,
   openWorktreePrompt,
   openClonePrompt,
   composerInputRef,
@@ -142,9 +140,7 @@ ${message}`);
   const handleAddAgent = useCallback(
     async (workspace: WorkspaceInfo) => {
       exitDiffView();
-      selectWorkspace(workspace.id);
-      setActiveThreadId(null, workspace.id);
-      onStartNewAgentDraft(workspace.id);
+      openDraftRuntime(workspace.id);
       Sentry.metrics.count("agent_created", 1, {
         attributes: {
           workspace_id: workspace.id,
@@ -159,11 +155,7 @@ ${message}`);
     [
       composerInputRef,
       exitDiffView,
-      isCompact,
-      onStartNewAgentDraft,
-      selectWorkspace,
-      setActiveThreadId,
-      setActiveTab,
+      openDraftRuntime,
     ],
   );
 

@@ -33,7 +33,9 @@
     "pretauri:dev:win": "npm run sync:material-icons",
     "tauri:dev:win": "npm run doctor:win && node scripts/run-tauri.mjs dev",
     "pretauri:build:win": "npm run sync:material-icons",
-    "tauri:build:win": "npm run doctor:win && node scripts/run-tauri.mjs build"
+    "tauri:build:win": "npm run doctor:win && node scripts/run-tauri.mjs build",
+    "pretauri:build:parallel:win": "npm run sync:material-icons",
+    "tauri:build:parallel:win": "npm run doctor:win && node scripts/run-tauri.mjs build --config src-tauri/tauri.windows.parallel.conf.json"
   },
   "dependencies": {
     "@pierre/diffs": "^1.0.6",

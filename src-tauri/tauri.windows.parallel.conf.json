@@ -1,0 +1,15 @@
+{
+  "productName": "Codex Monitor Parallel Test",
+  "identifier": "com.dimillian.codexmonitor.paralleltest",
+  "app": {
+    "windows": [
+      {
+        "title": "Codex Monitor Parallel Test"
+      }
+    ]
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "publisher": "Local Test Build"
+  }
+}

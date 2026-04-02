@@ -619,7 +619,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-monitor"
+name = "codex-monitor-parallel-test"
 version = "0.7.68"
 dependencies = [
  "base64 0.22.1",

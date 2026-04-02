@@ -67,6 +67,7 @@ type DesktopLayoutProps = {
   centerMode: "chat" | "diff";
   preloadGitDiffs: boolean;
   splitChatDiffView: boolean;
+  runtimeTabsNode: ReactNode;
   messagesNode: ReactNode;
   gitDiffViewerNode: ReactNode;
   gitDiffPanelNode: ReactNode;
@@ -94,6 +95,7 @@ export function DesktopLayout({
   centerMode,
   preloadGitDiffs,
   splitChatDiffView,
+  runtimeTabsNode,
   messagesNode,
   gitDiffViewerNode,
   gitDiffPanelNode,
@@ -109,7 +111,13 @@ export function DesktopLayout({
 }: DesktopLayoutProps) {
   const diffLayerRef = useRef<HTMLDivElement | null>(null);
   const chatLayerRef = useRef<HTMLDivElement | null>(null);
-  const chatPaneNode = <ChatPane messagesNode={messagesNode} composerNode={composerNode} />;
+  const chatPaneNode = (
+    <ChatPane
+      topNode={runtimeTabsNode}
+      messagesNode={messagesNode}
+      composerNode={composerNode}
+    />
+  );
   const diffLayerActive = isActiveLayer(centerMode, "diff");
   const chatLayerActive = isActiveLayer(centerMode, "chat");
   const showDiffViewer = shouldRenderDiffViewer({

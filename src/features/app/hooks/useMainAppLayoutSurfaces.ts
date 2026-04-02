@@ -10,6 +10,8 @@ import type { useMainAppPromptActions } from "@app/hooks/useMainAppPromptActions
 import type { useMainAppSidebarMenuOrchestration } from "@app/hooks/useMainAppSidebarMenuOrchestration";
 import type { useMainAppWorktreeState } from "@app/hooks/useMainAppWorktreeState";
 import type { LayoutNodesOptions } from "@/features/layout/hooks/layoutNodes/types";
+import type { RuntimeHostState } from "@app/runtime/runtimeHost";
+import type { useRuntimeTabManager } from "@app/hooks/useRuntimeTabManager";
 
 type SidebarProps = LayoutNodesOptions["primary"]["sidebarProps"];
 type ComposerProps = NonNullable<LayoutNodesOptions["primary"]["composerProps"]>;
@@ -83,6 +85,8 @@ type UseMainAppLayoutSurfacesArgs = {
   onUsageWorkspaceChange: LayoutNodesOptions["primary"]["homeProps"]["onUsageWorkspaceChange"];
   gitState: ReturnType<typeof useMainAppGitState>;
   composerWorkspaceState: ReturnType<typeof useMainAppComposerWorkspaceState>;
+  runtimeHost: RuntimeHostState;
+  runtimeTabManager: ReturnType<typeof useRuntimeTabManager>;
   promptActions: ReturnType<typeof useMainAppPromptActions>;
   worktreeState: ReturnType<typeof useMainAppWorktreeState>;
   sidebarHandlers: ReturnType<typeof useMainAppSidebarMenuOrchestration>;
@@ -285,6 +289,8 @@ function buildPrimarySurface({
   onUsageWorkspaceChange,
   gitState,
   composerWorkspaceState,
+  runtimeHost,
+  runtimeTabManager: _runtimeTabManager,
   worktreeState,
   sidebarHandlers,
   displayNodes,
@@ -410,6 +416,7 @@ function buildPrimarySurface({
       onAddWorkspace: handleAddWorkspace,
       onSelectHome: sidebarHandlers.onSelectHome,
       onSelectWorkspace: sidebarHandlers.onSelectWorkspace,
+      onSelectDraftAgent: sidebarHandlers.onSelectDraftAgent,
       onConnectWorkspace: sidebarHandlers.onConnectWorkspace,
       onAddAgent: handleAddAgent,
       onAddWorktreeAgent: handleAddWorktreeAgent,
@@ -436,6 +443,7 @@ function buildPrimarySurface({
       onWorkspaceDragLeave: workspaceDrop.onWorkspaceDragLeave,
       onWorkspaceDrop: workspaceDrop.onWorkspaceDrop,
     },
+    runtimeTabsProps: null,
     messagesProps: {
       items: activeItems,
       threadId: activeThreadId ?? null,
@@ -524,7 +532,8 @@ function buildPrimarySurface({
           files: composerWorkspaceState.files,
           textareaRef: composerInputRef,
           historyKey: activeWorkspace?.id ?? null,
-          automationScopeKey: activeWorkspace?.id ?? null,
+          automationScopeKey: runtimeHost.runtimeId,
+          automationController: runtimeHost.automation,
           automationConversationItems: activeItems,
           automationWorkspaceId: activeWorkspace?.id ?? null,
           automationThreadId: activeThreadId ?? null,
@@ -997,6 +1006,8 @@ export function useMainAppLayoutSurfaces({
   onUsageWorkspaceChange,
   gitState,
   composerWorkspaceState,
+  runtimeHost,
+  runtimeTabManager,
   promptActions,
   worktreeState,
   sidebarHandlers,
@@ -1157,9 +1168,11 @@ export function useMainAppLayoutSurfaces({
     usageWorkspaceId,
     usageWorkspaceOptions,
     onUsageWorkspaceChange,
-    gitState,
-    composerWorkspaceState,
-    promptActions,
+  gitState,
+  composerWorkspaceState,
+  runtimeHost,
+  runtimeTabManager,
+  promptActions,
     worktreeState,
     sidebarHandlers,
     displayNodes,

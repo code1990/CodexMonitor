@@ -1,6 +1,7 @@
 import type { ComponentProps, ReactNode } from "react";
 import { ApprovalToasts } from "../../../app/components/ApprovalToasts";
 import { MainHeader } from "../../../app/components/MainHeader";
+import { RuntimeTabBar } from "../../../app/components/RuntimeTabBar";
 import { Sidebar } from "../../../app/components/Sidebar";
 import { TabBar } from "../../../app/components/TabBar";
 import { TabletNav } from "../../../app/components/TabletNav";
@@ -39,6 +40,7 @@ export type WorktreeRenameState = {
 
 export type LayoutPrimarySurface = {
   sidebarProps: ComponentProps<typeof Sidebar>;
+  runtimeTabsProps: ComponentProps<typeof RuntimeTabBar> | null;
   messagesProps: ComponentProps<typeof Messages>;
   composerProps: ComponentProps<typeof Composer> | null;
   approvalToastsProps: ComponentProps<typeof ApprovalToasts>;
@@ -91,6 +93,7 @@ export type LayoutNodesOptions = {
 
 export type LayoutNodesResult = {
   sidebarNode: ReactNode;
+  runtimeTabsNode: ReactNode;
   messagesNode: ReactNode;
   composerNode: ReactNode;
   approvalToastsNode: ReactNode;

@@ -64,6 +64,7 @@ type SidebarWorkspaceGroupsProps = {
   newAgentDraftWorkspaceId?: string | null;
   startingDraftThreadWorkspaceId?: string | null;
   onSelectWorkspace: (workspaceId: string) => void;
+  onSelectDraftAgent: (workspaceId: string) => void;
   onConnectWorkspace: (workspace: WorkspaceInfo) => void;
   onAddAgent: (workspace: WorkspaceInfo) => void;
   onAddWorktreeAgent: (workspace: WorkspaceInfo) => void;
@@ -127,6 +128,7 @@ function SidebarWorkspaceEntry({
   newAgentDraftWorkspaceId,
   startingDraftThreadWorkspaceId,
   onSelectWorkspace,
+  onSelectDraftAgent,
   onConnectWorkspace,
   onAddAgent,
   onAddWorktreeAgent,
@@ -266,13 +268,13 @@ function SidebarWorkspaceEntry({
       {isDraftNewAgent && (
         <div
           className={`thread-row thread-row-draft${isDraftRowActive ? " active" : ""}`}
-          onClick={() => onSelectWorkspace(workspace.id)}
+          onClick={() => onSelectDraftAgent(workspace.id)}
           role="button"
           tabIndex={0}
           onKeyDown={(event) => {
             if (event.key === "Enter" || event.key === " ") {
               event.preventDefault();
-              onSelectWorkspace(workspace.id);
+              onSelectDraftAgent(workspace.id);
             }
           }}
         >

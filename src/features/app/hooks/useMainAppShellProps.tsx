@@ -16,7 +16,10 @@ type UseMainAppShellPropsArgs = {
     | "mobileSetupWizardProps"
   >;
   gitHubPanelDataProps: ComponentProps<typeof MainAppShell>["gitHubPanelDataProps"];
-  appLayout: Omit<ComponentProps<typeof MainAppShell>["appLayoutProps"], "desktopTopbarLeftNode" | "topbarActionsNode">;
+  appLayout: Omit<
+    ComponentProps<typeof MainAppShell>["appLayoutProps"],
+    "desktopTopbarLeftNode" | "topbarActionsNode"
+  >;
   topbar: {
     isCompact: boolean;
     desktopTopbarLeftNode: ComponentProps<typeof MainAppShell>["appLayoutProps"]["desktopTopbarLeftNode"];

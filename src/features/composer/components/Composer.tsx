@@ -48,6 +48,7 @@ import { ComposerMetaBar } from "./ComposerMetaBar";
 import { ComposerQueue } from "./ComposerQueue";
 import { isMacPlatform } from "../../../utils/platformPaths";
 import type { CodexArgsOption } from "../../threads/utils/codexArgsProfiles";
+import type { RuntimeAutomationController } from "@app/runtime/runtimeHost";
 import {
   listTextFilesInDirectory,
   pickDirectory,
@@ -149,6 +150,7 @@ type ComposerProps = {
   onReviewPromptConfirmCustom?: () => Promise<void>;
   onFileAutocompleteActiveChange?: (active: boolean) => void;
   automationScopeKey?: string | null;
+  automationController?: RuntimeAutomationController | null;
   automationConversationItems?: ConversationItem[];
   automationWorkspaceId?: string | null;
   automationThreadId?: string | null;
@@ -256,6 +258,7 @@ export const Composer = memo(function Composer({
   onReviewPromptConfirmCustom,
   onFileAutocompleteActiveChange,
   automationScopeKey = null,
+  automationController = null,
   automationConversationItems = [],
   automationWorkspaceId = null,
   automationThreadId = null,
@@ -334,6 +337,16 @@ export const Composer = memo(function Composer({
         "default",
       ),
   });
+  const effectiveAutomationEnabled = automationController?.enabled ?? automationEnabled;
+  const effectiveAutomationTasks = automationController?.tasks ?? automationTasks;
+  const effectiveAutomationSummary = automationController?.summary ?? automationSummary;
+  const setEffectiveAutomationEnabled =
+    automationController?.setEnabled ?? setAutomationEnabled;
+  const importEffectiveTasks = automationController?.importTasks ?? importTasks;
+  const importEffectiveTasksFromText =
+    automationController?.importTasksFromText ?? importTasksFromText;
+  const clearEffectiveAutomationTasks =
+    automationController?.clearAutomationTasks ?? clearAutomationTasks;
 
   const setComposerText = useCallback(
     (next: string) => {
@@ -444,10 +457,13 @@ export const Composer = memo(function Composer({
   );
 
   useEffect(() => {
-    if (automationSummary.hasTerminalIssue) {
-      setAutomationEnabled(false);
+    if (effectiveAutomationSummary.hasTerminalIssue) {
+      setEffectiveAutomationEnabled(false);
     }
-  }, [automationSummary.hasTerminalIssue]);
+  }, [
+    effectiveAutomationSummary.hasTerminalIssue,
+    setEffectiveAutomationEnabled,
+  ]);
 
   useEffect(() => {
     exportedAutomationTaskIdsRef.current = new Set();
@@ -524,10 +540,10 @@ export const Composer = memo(function Composer({
         return;
       }
       const content = await file.text();
-      importTasksFromText(file.name, content);
+      importEffectiveTasksFromText(file.name, content);
       event.target.value = "";
     },
-    [importTasksFromText],
+    [importEffectiveTasksFromText],
   );
 
   const handleAutomationPromptFileChange = useCallback(
@@ -552,7 +568,7 @@ export const Composer = memo(function Composer({
     }
     const filesInDirectory = await listTextFilesInDirectory(directory, ["md"]);
     const directorySegments = directory.split(/[\\/]/).filter(Boolean);
-    importTasks(
+    importEffectiveTasks(
       directorySegments[directorySegments.length - 1] ?? directory,
       filesInDirectory.map((entry, index) => ({
         lineNumber: index + 1,
@@ -562,16 +578,16 @@ export const Composer = memo(function Composer({
         exportFileName: entry.name,
       })),
     );
-    setAutomationEnabled(false);
+    setEffectiveAutomationEnabled(false);
     setAutomationDirectorySourceName(directory);
-  }, [importTasks]);
+  }, [importEffectiveTasks, setEffectiveAutomationEnabled]);
 
   const handleClearAutomation = useCallback(() => {
-    setAutomationEnabled(false);
-    clearAutomationTasks();
+    setEffectiveAutomationEnabled(false);
+    clearEffectiveAutomationTasks();
     exportedAutomationTaskIdsRef.current = new Set();
     setAutomationDirectorySourceName(null);
-  }, [clearAutomationTasks]);
+  }, [clearEffectiveAutomationTasks, setEffectiveAutomationEnabled]);
 
   const getLastAssistantMessage = useCallback((items: ConversationItem[]) => {
     for (let index = items.length - 1; index >= 0; index -= 1) {
@@ -587,7 +603,7 @@ export const Composer = memo(function Composer({
     if (!automationAutoExportEnabled || !automationDownloadDirectory) {
       return;
     }
-    const completedTask = automationTasks.find(
+    const completedTask = effectiveAutomationTasks.find(
       (task) =>
         task.status === "completed" &&
         !exportedAutomationTaskIdsRef.current.has(task.id),
@@ -613,7 +629,7 @@ export const Composer = memo(function Composer({
     automationAutoExportEnabled,
     automationConversationItems,
     automationDownloadDirectory,
-    automationTasks,
+    effectiveAutomationTasks,
     automationThreadId,
     automationWorkspaceId,
     getLastAssistantMessage,
@@ -805,22 +821,22 @@ export const Composer = memo(function Composer({
   return (
     <footer className={`composer${disabled ? " is-disabled" : ""}`}>
       <ComposerAutomationPanel
-        enabled={automationEnabled}
+        enabled={effectiveAutomationEnabled}
         busy={isProcessing}
         blocked={disabled}
         timeoutSeconds={automationTimeoutSeconds}
         pauseSeconds={automationPauseSeconds}
-        sourceName={automationSummary.sourceName}
+        sourceName={effectiveAutomationSummary.sourceName}
         directorySourceName={automationDirectorySourceName}
         promptSourceName={automationPromptSourceName}
         promptEnabled={automationPromptEnabled}
         autoExportEnabled={automationAutoExportEnabled}
         downloadDirectory={automationDownloadDirectory}
-        tasks={automationTasks}
-        summary={automationSummary}
+        tasks={effectiveAutomationTasks}
+        summary={effectiveAutomationSummary}
         fileInputRef={automationFileInputRef}
         promptFileInputRef={automationPromptFileInputRef}
-        onToggleEnabled={setAutomationEnabled}
+        onToggleEnabled={setEffectiveAutomationEnabled}
         onTogglePromptEnabled={setAutomationPromptEnabled}
         onToggleAutoExportEnabled={setAutomationAutoExportEnabled}
         onOpenFilePicker={() => automationFileInputRef.current?.click()}
