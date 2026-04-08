@@ -134,8 +134,12 @@ export default function MainApp() {
   const [activeTab, setActiveTab] = useState<
     "home" | "projects" | "codex" | "git" | "log"
   >("codex");
+  const [conversationHidden, setConversationHidden] = useState(false);
   const tabletTab =
     activeTab === "projects" || activeTab === "home" ? "codex" : activeTab;
+  const handleToggleConversationHidden = useCallback(() => {
+    setConversationHidden((current) => !current);
+  }, []);
   const {
     workspaces,
     workspaceGroups,
@@ -1704,6 +1708,8 @@ export default function MainApp() {
     activeWorkspace,
     activeWorkspaceId,
     activeThreadId,
+    conversationHidden,
+    onToggleConversationHidden: handleToggleConversationHidden,
     activeItems,
     userInputRequests,
     approvals,
@@ -1900,6 +1906,7 @@ export default function MainApp() {
   } = useMainAppLayoutNodes(layoutSurfaces);
 
   const mainMessagesNode = showWorkspaceHome ? workspaceHomeNode : messagesNode;
+  const messagesHidden = conversationHidden && !showWorkspaceHome;
   const compactThreadConnectionState: "live" | "polling" | "disconnected" =
     !activeWorkspace?.connected
       ? "disconnected"
@@ -1942,6 +1949,7 @@ export default function MainApp() {
       sidebarNode,
       runtimeTabsNode,
       messagesNode: mainMessagesNode,
+      messagesHidden,
       composerNode,
       approvalToastsNode,
       updateToastNode,

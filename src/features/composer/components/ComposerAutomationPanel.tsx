@@ -35,6 +35,8 @@ type ComposerAutomationPanelProps = {
   onFileChange: (event: ChangeEvent<HTMLInputElement>) => void | Promise<void>;
   onPromptFileChange: (event: ChangeEvent<HTMLInputElement>) => void | Promise<void>;
   onClear: () => void;
+  conversationHidden?: boolean;
+  onToggleConversationHidden?: () => void;
   onTimeoutSecondsChange: (value: number) => void;
   onPauseSecondsChange: (value: number) => void;
 };
@@ -105,6 +107,8 @@ export function ComposerAutomationPanel({
   onFileChange,
   onPromptFileChange,
   onClear,
+  conversationHidden = false,
+  onToggleConversationHidden,
   onTimeoutSecondsChange,
   onPauseSecondsChange,
 }: ComposerAutomationPanelProps) {
@@ -132,38 +136,45 @@ export function ComposerAutomationPanel({
         <button type="button" className="ghost" onClick={() => void onPickDownloadDirectory()}>
           Download Dir
         </button>
-        <label className="composer-automation-timeout">
-          <span>Timeout(s)</span>
-          <input
-            type="number"
-            min={5}
-            step={5}
-            value={timeoutSeconds}
-            onChange={(event) =>
-              onTimeoutSecondsChange(Number.parseInt(event.target.value, 10) || 5)
-            }
-          />
-        </label>
-        <label className="composer-automation-timeout">
-          <span>Pause(s)</span>
-          <input
-            type="number"
-            min={0}
-            step={1}
-            value={pauseSeconds}
-            onChange={(event) =>
-              onPauseSecondsChange(Math.max(0, Number.parseInt(event.target.value, 10) || 0))
-            }
-          />
-        </label>
-        <button
-          type="button"
-          className="ghost"
-          disabled={summary.total === 0}
-          onClick={onClear}
-        >
-          Clear
-        </button>
+        <div className="composer-automation-inline-controls">
+          <label className="composer-automation-timeout">
+            <span>Timeout(s)</span>
+            <input
+              type="number"
+              min={5}
+              step={5}
+              value={timeoutSeconds}
+              onChange={(event) =>
+                onTimeoutSecondsChange(Number.parseInt(event.target.value, 10) || 5)
+              }
+            />
+          </label>
+          <label className="composer-automation-timeout">
+            <span>Pause(s)</span>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={pauseSeconds}
+              onChange={(event) =>
+                onPauseSecondsChange(Math.max(0, Number.parseInt(event.target.value, 10) || 0))
+              }
+            />
+          </label>
+          <button
+            type="button"
+            className="ghost"
+            disabled={summary.total === 0}
+            onClick={onClear}
+          >
+            Clear
+          </button>
+          {onToggleConversationHidden ? (
+            <button type="button" className="ghost" onClick={onToggleConversationHidden}>
+              {conversationHidden ? "Show" : "Hide"}
+            </button>
+          ) : null}
+        </div>
         <input
           ref={fileInputRef}
           className="composer-automation-file"

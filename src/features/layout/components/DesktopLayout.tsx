@@ -69,6 +69,7 @@ type DesktopLayoutProps = {
   splitChatDiffView: boolean;
   runtimeTabsNode: ReactNode;
   messagesNode: ReactNode;
+  messagesHidden: boolean;
   gitDiffViewerNode: ReactNode;
   gitDiffPanelNode: ReactNode;
   planPanelNode: ReactNode;
@@ -97,6 +98,7 @@ export function DesktopLayout({
   splitChatDiffView,
   runtimeTabsNode,
   messagesNode,
+  messagesHidden,
   gitDiffViewerNode,
   gitDiffPanelNode,
   planPanelNode,
@@ -116,6 +118,7 @@ export function DesktopLayout({
       topNode={runtimeTabsNode}
       messagesNode={messagesNode}
       composerNode={composerNode}
+      messagesHidden={messagesHidden}
     />
   );
   const diffLayerActive = isActiveLayer(centerMode, "diff");

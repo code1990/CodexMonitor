@@ -138,6 +138,7 @@ export function useRuntimeHost({
           summary: automationController.summary,
           setEnabled: automationController.setAutomationEnabled,
           importTasks: automationController.importTasks,
+          appendTasks: automationController.appendTasks,
           importTasksFromText: automationController.importTasksFromText,
           clearAutomationTasks: automationController.clearAutomationTasks,
         }

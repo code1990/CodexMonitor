@@ -88,6 +88,7 @@ export const RuntimeAutomationBridge = memo(function RuntimeAutomationBridge({
       summary: automationController.summary,
       setEnabled: automationController.setAutomationEnabled,
       importTasks: automationController.importTasks,
+      appendTasks: automationController.appendTasks,
       importTasksFromText: automationController.importTasksFromText,
       clearAutomationTasks: automationController.clearAutomationTasks,
     });
@@ -96,6 +97,7 @@ export const RuntimeAutomationBridge = memo(function RuntimeAutomationBridge({
     };
   }, [
     automationController.clearAutomationTasks,
+    automationController.appendTasks,
     automationController.importTasks,
     automationController.importTasksFromText,
     automationController.setAutomationEnabled,

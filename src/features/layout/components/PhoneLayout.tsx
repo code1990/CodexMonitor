@@ -19,6 +19,7 @@ type PhoneLayoutProps = {
   topbarActionsNode?: ReactNode;
   runtimeTabsNode: ReactNode;
   messagesNode: ReactNode;
+  messagesHidden: boolean;
   composerNode: ReactNode;
   gitDiffPanelNode: ReactNode;
   gitDiffViewerNode: ReactNode;
@@ -42,6 +43,7 @@ export function PhoneLayout({
   topbarActionsNode,
   runtimeTabsNode,
   messagesNode,
+  messagesHidden,
   composerNode,
   gitDiffPanelNode,
   gitDiffViewerNode,
@@ -68,6 +70,7 @@ export function PhoneLayout({
                   topNode={runtimeTabsNode}
                   messagesNode={messagesNode}
                   composerNode={composerNode}
+                  messagesHidden={messagesHidden}
                 />
               </div>
             </>

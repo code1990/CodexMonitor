@@ -11,6 +11,7 @@ export type RuntimeAutomationController = {
   summary: AutoTaskSummary;
   setEnabled: (enabled: boolean) => void;
   importTasks: (label: string, taskInputs: AutoTaskImportInput[]) => void;
+  appendTasks: (label: string, taskInputs: AutoTaskImportInput[]) => void;
   importTasksFromText: (fileName: string, content: string) => void;
   clearAutomationTasks: () => void;
 };

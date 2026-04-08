@@ -87,6 +87,13 @@ export function useRuntimeAutoTaskRunner({
     [runner],
   );
 
+  const appendTasks = useCallback(
+    (label: string, taskInputs: AutoTaskImportInput[]) => {
+      runner.appendTasks(label, taskInputs);
+    },
+    [runner],
+  );
+
   const importTasksFromText = useCallback(
     (fileName: string, content: string) => {
       runner.importTasksFromText(fileName, content);
@@ -117,6 +124,7 @@ export function useRuntimeAutoTaskRunner({
     ...runner,
     setAutomationEnabled,
     importTasks,
+    appendTasks,
     importTasksFromText,
     clearAutomationTasks,
   };

@@ -55,6 +55,8 @@ type UseMainAppLayoutSurfacesArgs = {
   activeWorkspace: WorkspaceInfo | null;
   activeWorkspaceId: string | null;
   activeThreadId: string | null;
+  conversationHidden: boolean;
+  onToggleConversationHidden: () => void;
   activeItems: LayoutNodesOptions["primary"]["messagesProps"]["items"];
   userInputRequests: SidebarProps["userInputRequests"];
   approvals: LayoutNodesOptions["primary"]["approvalToastsProps"]["approvals"];
@@ -260,6 +262,8 @@ function buildPrimarySurface({
   activeWorkspace,
   activeWorkspaceId,
   activeThreadId,
+  conversationHidden,
+  onToggleConversationHidden,
   activeItems,
   userInputRequests,
   approvals,
@@ -537,6 +541,8 @@ function buildPrimarySurface({
           automationConversationItems: activeItems,
           automationWorkspaceId: activeWorkspace?.id ?? null,
           automationThreadId: activeThreadId ?? null,
+          conversationHidden,
+          onToggleConversationHidden,
           editorSettings: composerEditorSettings,
           editorExpanded: composerEditorExpanded,
           onToggleEditorExpanded: onToggleComposerEditorExpanded,
@@ -976,6 +982,8 @@ export function useMainAppLayoutSurfaces({
   activeWorkspace,
   activeWorkspaceId,
   activeThreadId,
+  conversationHidden,
+  onToggleConversationHidden,
   activeItems,
   userInputRequests,
   approvals,
@@ -1140,6 +1148,8 @@ export function useMainAppLayoutSurfaces({
     activeWorkspace,
     activeWorkspaceId,
     activeThreadId,
+    conversationHidden,
+    onToggleConversationHidden,
     activeItems,
     userInputRequests,
     approvals,

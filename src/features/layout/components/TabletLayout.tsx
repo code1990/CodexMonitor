@@ -17,6 +17,7 @@ type TabletLayoutProps = {
   topbarActionsNode?: ReactNode;
   runtimeTabsNode: ReactNode;
   messagesNode: ReactNode;
+  messagesHidden: boolean;
   composerNode: ReactNode;
   gitDiffPanelNode: ReactNode;
   gitDiffViewerNode: ReactNode;
@@ -38,6 +39,7 @@ export function TabletLayout({
   topbarActionsNode,
   runtimeTabsNode,
   messagesNode,
+  messagesHidden,
   composerNode,
   gitDiffPanelNode,
   gitDiffViewerNode,
@@ -72,6 +74,7 @@ export function TabletLayout({
                   topNode={runtimeTabsNode}
                   messagesNode={messagesNode}
                   composerNode={composerNode}
+                  messagesHidden={messagesHidden}
                 />
               </div>
             )}
