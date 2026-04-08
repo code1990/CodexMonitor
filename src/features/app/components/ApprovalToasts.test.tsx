@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ApprovalRequest, WorkspaceInfo } from "../../../types";
 import { ApprovalToasts } from "./ApprovalToasts";
 
@@ -30,6 +30,11 @@ const approvals: ApprovalRequest[] = [
 ];
 
 describe("ApprovalToasts", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    cleanup();
+  });
+
   it("renders live-region semantics and handles Enter on primary request", () => {
     const onDecision = vi.fn();
     render(
@@ -56,5 +61,42 @@ describe("ApprovalToasts", () => {
     fireEvent.keyDown(window, { key: "Enter" });
     expect(onDecision).not.toHaveBeenCalled();
     document.body.removeChild(input);
+  });
+
+  it("auto-approves after 5 seconds when remember is unavailable", () => {
+    vi.useFakeTimers();
+    const onDecision = vi.fn();
+    render(
+      <ApprovalToasts approvals={approvals} workspaces={workspaces} onDecision={onDecision} />,
+    );
+
+    expect(screen.getByRole("button", { name: "Approve (5s)" })).toBeTruthy();
+
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    expect(onDecision).toHaveBeenCalledWith(approvals[1], "accept");
+  });
+
+  it("auto-remembers allowed commands after 5 seconds when available", () => {
+    vi.useFakeTimers();
+    const onDecision = vi.fn();
+    const onRemember = vi.fn();
+    render(
+      <ApprovalToasts
+        approvals={approvals}
+        workspaces={workspaces}
+        onDecision={onDecision}
+        onRemember={onRemember}
+      />,
+    );
+
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    expect(onRemember).toHaveBeenCalledTimes(1);
+    expect(onDecision).not.toHaveBeenCalled();
   });
 });

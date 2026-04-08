@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ApprovalRequest, WorkspaceInfo } from "../../../types";
 import { getApprovalCommandInfo } from "../../../utils/approvalRules";
 import {
@@ -24,6 +24,7 @@ export function ApprovalToasts({
   onDecision,
   onRemember,
 }: ApprovalToastsProps) {
+  const [countdown, setCountdown] = useState(5);
   const workspaceLabels = useMemo(
     () => new Map(workspaces.map((workspace) => [workspace.id, workspace.name])),
     [workspaces],
@@ -57,6 +58,29 @@ export function ApprovalToasts({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [onDecision, primaryRequest]);
+
+  useEffect(() => {
+    if (!primaryRequest) {
+      return;
+    }
+    setCountdown(5);
+    const intervalId = window.setInterval(() => {
+      setCountdown((current) => (current > 0 ? current - 1 : 0));
+    }, 1_000);
+    const timeoutId = window.setTimeout(() => {
+      const commandInfo = getApprovalCommandInfo(primaryRequest.params ?? {});
+      if (commandInfo && onRemember) {
+        onRemember(primaryRequest, commandInfo.tokens);
+        return;
+      }
+      onDecision(primaryRequest, "accept");
+    }, 5_000);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.clearTimeout(timeoutId);
+    };
+  }, [onDecision, onRemember, primaryRequest]);
 
   if (!approvals.length) {
     return null;
@@ -156,7 +180,7 @@ export function ApprovalToasts({
                 className="primary"
                 onClick={() => onDecision(request, "accept")}
               >
-                Approve (Enter)
+                {request === primaryRequest ? `Approve (${countdown}s)` : "Approve (Enter)"}
               </button>
             </ToastActions>
           </ToastCard>
