@@ -17,6 +17,7 @@ type AppLayoutProps = {
   activeWorkspace: boolean;
   sidebarNode: ReactNode;
   messagesNode: ReactNode;
+  messagesHidden: boolean;
   composerNode: ReactNode;
   approvalToastsNode: ReactNode;
   updateToastNode: ReactNode;
@@ -56,6 +57,7 @@ export const AppLayout = memo(function AppLayout({
   activeWorkspace,
   sidebarNode,
   messagesNode,
+  messagesHidden,
   composerNode,
   approvalToastsNode,
   updateToastNode,
@@ -98,6 +100,7 @@ export const AppLayout = memo(function AppLayout({
         topbarLeftNode={mainHeaderNode}
         topbarActionsNode={topbarActionsNode}
         messagesNode={messagesNode}
+        messagesHidden={messagesHidden}
         composerNode={composerNode}
         gitDiffPanelNode={gitDiffPanelNode}
         gitDiffViewerNode={gitDiffViewerNode}
@@ -122,6 +125,7 @@ export const AppLayout = memo(function AppLayout({
         topbarLeftNode={mainHeaderNode}
         topbarActionsNode={topbarActionsNode}
         messagesNode={messagesNode}
+        messagesHidden={messagesHidden}
         composerNode={composerNode}
         gitDiffPanelNode={gitDiffPanelNode}
         gitDiffViewerNode={gitDiffViewerNode}
@@ -145,6 +149,7 @@ export const AppLayout = memo(function AppLayout({
       preloadGitDiffs={preloadGitDiffs}
       splitChatDiffView={splitChatDiffView}
       messagesNode={messagesNode}
+      messagesHidden={messagesHidden}
       gitDiffViewerNode={gitDiffViewerNode}
       gitDiffPanelNode={gitDiffPanelNode}
       planPanelNode={planPanelNode}

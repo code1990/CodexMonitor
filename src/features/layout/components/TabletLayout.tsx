@@ -16,6 +16,7 @@ type TabletLayoutProps = {
   topbarLeftNode: ReactNode;
   topbarActionsNode?: ReactNode;
   messagesNode: ReactNode;
+  messagesHidden: boolean;
   composerNode: ReactNode;
   gitDiffPanelNode: ReactNode;
   gitDiffViewerNode: ReactNode;
@@ -36,6 +37,7 @@ export function TabletLayout({
   topbarLeftNode,
   topbarActionsNode,
   messagesNode,
+  messagesHidden,
   composerNode,
   gitDiffPanelNode,
   gitDiffViewerNode,
@@ -66,7 +68,11 @@ export function TabletLayout({
             />
             {tabletTab === "codex" && (
               <div className="content tablet-content">
-                <ChatPane messagesNode={messagesNode} composerNode={composerNode} />
+                <ChatPane
+                  messagesNode={messagesNode}
+                  composerNode={composerNode}
+                  messagesHidden={messagesHidden}
+                />
               </div>
             )}
             {tabletTab === "git" && (

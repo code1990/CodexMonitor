@@ -152,6 +152,8 @@ type ComposerProps = {
   automationConversationItems?: ConversationItem[];
   automationWorkspaceId?: string | null;
   automationThreadId?: string | null;
+  conversationHidden?: boolean;
+  onToggleConversationHidden?: () => void;
   contextActions?: {
     id: string;
     label: string;
@@ -259,6 +261,8 @@ export const Composer = memo(function Composer({
   automationConversationItems = [],
   automationWorkspaceId = null,
   automationThreadId = null,
+  conversationHidden = false,
+  onToggleConversationHidden,
   contextActions = [],
 }: ComposerProps) {
   const automationStorageKey = `composer-automation:${automationScopeKey ?? "global"}`;
@@ -316,7 +320,7 @@ export const Composer = memo(function Composer({
   const {
     tasks: automationTasks,
     summary: automationSummary,
-    importTasks,
+    appendTasks,
     importTasksFromText,
     clearAutomationTasks,
   } = useAutoTaskRunner({
@@ -546,13 +550,13 @@ export const Composer = memo(function Composer({
   );
 
   const handleAutomationDirectoryPick = useCallback(async () => {
-    const directory = await pickDirectory("Select markdown task folder");
+    const directory = await pickDirectory("Select markdown/text task folder");
     if (!directory) {
       return;
     }
-    const filesInDirectory = await listTextFilesInDirectory(directory, ["md"]);
+    const filesInDirectory = await listTextFilesInDirectory(directory, ["md", "txt"]);
     const directorySegments = directory.split(/[\\/]/).filter(Boolean);
-    importTasks(
+    appendTasks(
       directorySegments[directorySegments.length - 1] ?? directory,
       filesInDirectory.map((entry, index) => ({
         lineNumber: index + 1,
@@ -563,8 +567,17 @@ export const Composer = memo(function Composer({
       })),
     );
     setAutomationEnabled(false);
-    setAutomationDirectorySourceName(directory);
-  }, [importTasks]);
+    setAutomationDirectorySourceName((current) =>
+      current
+        ? current
+            .split(/\s*,\s*/)
+            .filter(Boolean)
+            .includes(directory)
+          ? current
+          : `${current}, ${directory}`
+        : directory,
+    );
+  }, [appendTasks]);
 
   const handleClearAutomation = useCallback(() => {
     setAutomationEnabled(false);
@@ -837,6 +850,8 @@ export const Composer = memo(function Composer({
         onFileChange={handleAutomationFileChange}
         onPromptFileChange={handleAutomationPromptFileChange}
         onClear={handleClearAutomation}
+        conversationHidden={conversationHidden}
+        onToggleConversationHidden={onToggleConversationHidden}
         onTimeoutSecondsChange={(value) => {
           setAutomationTimeoutSeconds(Math.max(5, value));
         }}

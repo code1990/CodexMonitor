@@ -922,12 +922,13 @@
 }
 
 .chat-pane {
-  --composer-overlay-height: 0px;
   position: relative;
   display: flex;
+  flex-direction: column;
   flex: 1;
   min-height: 0;
   min-width: 0;
+  overflow: hidden;
 }
 
 .chat-pane-messages {
@@ -935,19 +936,12 @@
   flex: 1;
   min-height: 0;
   min-width: 0;
+  overflow: hidden;
 }
 
 .chat-pane-composer {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
   z-index: 2;
-  pointer-events: none;
-}
-
-.chat-pane-composer > .composer {
-  pointer-events: auto;
+  flex: 0 0 auto;
 }
 
 .content-split {

@@ -131,4 +131,48 @@ describe("useAutoTaskRunner", () => {
     expect(result.current.tasks[0]?.status).toBe("timed_out");
     expect(result.current.summary.hasTerminalIssue).toBe(true);
   });
+
+  it("appends imported tasks and deduplicates by source path", () => {
+    const onDispatchTask = vi.fn().mockResolvedValue(undefined);
+    const { result } = renderHook(() =>
+      useAutoTaskRunner({
+        enabled: false,
+        isProcessing: false,
+        isBlocked: false,
+        timeoutMs: 10_000,
+        pauseAfterCompletionMs: 0,
+        scopeKey: "workspace-1",
+        onDispatchTask,
+      }),
+    );
+
+    act(() => {
+      result.current.appendTasks("folder-a", [
+        {
+          lineNumber: 1,
+          text: "first task",
+          sourceFileName: "a.md",
+          sourcePath: "D:/md/a.md",
+        },
+      ]);
+      result.current.appendTasks("folder-b", [
+        {
+          lineNumber: 1,
+          text: "first task",
+          sourceFileName: "a.md",
+          sourcePath: "D:/md/a.md",
+        },
+        {
+          lineNumber: 2,
+          text: "second task",
+          sourceFileName: "b.md",
+          sourcePath: "D:/md/b.md",
+        },
+      ]);
+    });
+
+    expect(result.current.tasks).toHaveLength(2);
+    expect(result.current.tasks.map((task) => task.text)).toEqual(["first task", "second task"]);
+    expect(result.current.summary.sourceName).toBe("folder-a, folder-b");
+  });
 });

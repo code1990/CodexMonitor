@@ -47,6 +47,38 @@ type AutoTaskSummary = {
 const createTaskId = (lineNumber: number) =>
   `auto-task-${lineNumber}-${Math.random().toString(36).slice(2, 8)}`;
 
+const normalizeTaskKey = ({
+  text,
+  sourcePath,
+  sourceFileName,
+}: Pick<AutoTaskImportInput, "text" | "sourcePath" | "sourceFileName">) => {
+  const normalizedPath = sourcePath?.trim().replace(/\\/g, "/").toLowerCase();
+  if (normalizedPath) {
+    return `path:${normalizedPath}`;
+  }
+  const normalizedFileName = sourceFileName?.trim().toLowerCase() ?? "";
+  const normalizedText = text.trim().replace(/\s+/g, " ");
+  return `content:${normalizedFileName}:${normalizedText}`;
+};
+
+const appendSourceLabel = (current: string | null, next: string) => {
+  const normalized = next.trim();
+  if (!normalized) {
+    return current;
+  }
+  if (!current) {
+    return normalized;
+  }
+  const labels = current
+    .split(/\s*,\s*/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  if (labels.includes(normalized)) {
+    return current;
+  }
+  return [...labels, normalized].join(", ");
+};
+
 export type AutoTaskImportInput = {
   lineNumber: number;
   text: string;
@@ -130,6 +162,46 @@ export function useAutoTaskRunner({
     setSourceName(label);
     setTasks(nextTasks);
   }, [clearCooldown, clearTimer]);
+
+  const appendTasks = useCallback((label: string, taskInputs: AutoTaskImportInput[]) => {
+    const now = Date.now();
+    setSourceName((current) => appendSourceLabel(current, label));
+    setTasks((current) => {
+      const existingKeys = new Set(
+        current.map((task) =>
+          normalizeTaskKey({
+            text: task.text,
+            sourcePath: task.sourcePath,
+            sourceFileName: task.sourceFileName,
+          }),
+        ),
+      );
+      const nextTasks: AutoTaskItem[] = [];
+      let nextLineNumber = current.length;
+      for (const input of taskInputs) {
+        const key = normalizeTaskKey(input);
+        if (existingKeys.has(key)) {
+          continue;
+        }
+        existingKeys.add(key);
+        nextLineNumber += 1;
+        nextTasks.push({
+          id: createTaskId(nextLineNumber),
+          lineNumber: nextLineNumber,
+          text: input.text,
+          sourceFileName: input.sourceFileName ?? null,
+          sourcePath: input.sourcePath ?? null,
+          exportFileName: input.exportFileName ?? null,
+          status: "pending",
+          createdAt: now,
+          startedAt: null,
+          completedAt: null,
+          error: null,
+        });
+      }
+      return nextTasks.length > 0 ? [...current, ...nextTasks] : current;
+    });
+  }, []);
 
   const importTasksFromText = useCallback((fileName: string, content: string) => {
     importTasks(fileName, parseTasks(content));
@@ -321,6 +393,7 @@ export function useAutoTaskRunner({
     tasks,
     summary,
     importTasks,
+    appendTasks,
     importTasksFromText,
     clearAutomationTasks,
   };
