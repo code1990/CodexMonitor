@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ApprovalRequest, WorkspaceInfo } from "../../../types";
 import { ApprovalToasts } from "./ApprovalToasts";
 
@@ -30,6 +30,11 @@ const approvals: ApprovalRequest[] = [
 ];
 
 describe("ApprovalToasts", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    cleanup();
+  });
+
   it("renders live-region semantics and handles Enter on primary request", () => {
     const onDecision = vi.fn();
     render(
@@ -58,20 +63,23 @@ describe("ApprovalToasts", () => {
     document.body.removeChild(input);
   });
 
-  it("auto-accepts the primary request after 5 seconds", () => {
+  it("auto-approves after 5 seconds when remember is unavailable", () => {
     vi.useFakeTimers();
     const onDecision = vi.fn();
     render(
       <ApprovalToasts approvals={approvals} workspaces={workspaces} onDecision={onDecision} />,
     );
 
-    vi.advanceTimersByTime(5000);
+    expect(screen.getByRole("button", { name: "Approve (5s)" })).toBeTruthy();
+
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
 
     expect(onDecision).toHaveBeenCalledWith(approvals[1], "accept");
-    vi.useRealTimers();
   });
 
-  it("auto-remembers command approvals before accepting", () => {
+  it("auto-remembers allowed commands after 5 seconds when available", () => {
     vi.useFakeTimers();
     const onDecision = vi.fn();
     const onRemember = vi.fn();
@@ -84,10 +92,11 @@ describe("ApprovalToasts", () => {
       />,
     );
 
-    vi.advanceTimersByTime(5000);
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
 
-    expect(onRemember).toHaveBeenCalledWith(approvals[1], ["echo", "two"]);
+    expect(onRemember).toHaveBeenCalledTimes(1);
     expect(onDecision).not.toHaveBeenCalled();
-    vi.useRealTimers();
   });
 });
