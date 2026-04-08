@@ -5,10 +5,6 @@ export type TerminalTab = {
   title: string;
 };
 
-type TerminalTabRecord = TerminalTab & {
-  autoNamed: boolean;
-};
-
 type UseTerminalTabsOptions = {
   activeWorkspaceId: string | null;
   onCloseTerminal?: (workspaceId: string, terminalId: string) => void;
@@ -21,85 +17,35 @@ function createTerminalId() {
   return `terminal-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function renumberAutoNamedTabs(tabs: TerminalTabRecord[]): TerminalTabRecord[] {
-  let autoNamedIndex = 1;
-  let changed = false;
-  const nextTabs = tabs.map((tab) => {
-    if (!tab.autoNamed) {
-      return tab;
-    }
-    const nextTitle = `Terminal ${autoNamedIndex}`;
-    autoNamedIndex += 1;
-    if (tab.title === nextTitle) {
-      return tab;
-    }
-    changed = true;
-    return {
-      ...tab,
-      title: nextTitle,
-    };
-  });
-  return changed ? nextTabs : tabs;
-}
-
 export function useTerminalTabs({
   activeWorkspaceId,
   onCloseTerminal,
 }: UseTerminalTabsOptions) {
-  const [tabsByWorkspace, setTabsByWorkspace] = useState<
-    Record<string, TerminalTabRecord[]>
-  >({});
-  const [activeTerminalIdByWorkspace, setActiveTerminalIdByWorkspace] = useState<
-    Record<string, string | null>
+  const [terminalByWorkspace, setTerminalByWorkspace] = useState<
+    Record<string, TerminalTab>
   >({});
 
   const createTerminal = useCallback((workspaceId: string) => {
     const id = createTerminalId();
-    setTabsByWorkspace((prev) => {
-      const existing = prev[workspaceId] ?? [];
-      const nextTabs = renumberAutoNamedTabs([
-        ...existing,
-        { id, title: "", autoNamed: true },
-      ]);
-      return {
-        ...prev,
-        [workspaceId]: nextTabs,
-      };
-    });
-    setActiveTerminalIdByWorkspace((prev) => ({ ...prev, [workspaceId]: id }));
+    setTerminalByWorkspace((prev) => ({
+      ...prev,
+      [workspaceId]: {
+        id,
+        title: "Terminal",
+      },
+    }));
     return id;
   }, []);
 
   const ensureTerminalWithTitle = useCallback(
     (workspaceId: string, terminalId: string, title: string) => {
-      setTabsByWorkspace((prev) => {
-        const existing = prev[workspaceId] ?? [];
-        const index = existing.findIndex((tab) => tab.id === terminalId);
-        if (index === -1) {
-          const nextTabs = renumberAutoNamedTabs([
-            ...existing,
-            { id: terminalId, title, autoNamed: false },
-          ]);
-          return {
-            ...prev,
-            [workspaceId]: nextTabs,
-          };
-        }
-        if (!existing[index].autoNamed && existing[index].title === title) {
-          return prev;
-        }
-        const nextTabs = existing.slice();
-        nextTabs[index] = {
-          ...existing[index],
+      setTerminalByWorkspace((prev) => ({
+        ...prev,
+        [workspaceId]: {
+          id: terminalId,
           title,
-          autoNamed: false,
-        };
-        return {
-          ...prev,
-          [workspaceId]: renumberAutoNamedTabs(nextTabs),
-        };
-      });
-      setActiveTerminalIdByWorkspace((prev) => ({ ...prev, [workspaceId]: terminalId }));
+        },
+      }));
       return terminalId;
     },
     [],
@@ -107,28 +53,13 @@ export function useTerminalTabs({
 
   const closeTerminal = useCallback(
     (workspaceId: string, terminalId: string) => {
-      setTabsByWorkspace((prev) => {
-        const existing = prev[workspaceId] ?? [];
-        const nextTabs = renumberAutoNamedTabs(
-          existing.filter((tab) => tab.id !== terminalId),
-        );
-        setActiveTerminalIdByWorkspace((prevActive) => {
-          const active = prevActive[workspaceId];
-          if (active !== terminalId) {
-            return prevActive;
-          }
-          const nextActive = nextTabs.length > 0 ? nextTabs[nextTabs.length - 1].id : null;
-          if (!nextActive) {
-            const { [workspaceId]: _, ...rest } = prevActive;
-            return rest;
-          }
-          return { ...prevActive, [workspaceId]: nextActive };
-        });
-        if (nextTabs.length === 0) {
-          const { [workspaceId]: _, ...rest } = prev;
-          return rest;
+      setTerminalByWorkspace((prev) => {
+        const existing = prev[workspaceId];
+        if (!existing || existing.id !== terminalId) {
+          return prev;
         }
-        return { ...prev, [workspaceId]: nextTabs };
+        const { [workspaceId]: _, ...rest } = prev;
+        return rest;
       });
       onCloseTerminal?.(workspaceId, terminalId);
     },
@@ -136,36 +67,46 @@ export function useTerminalTabs({
   );
 
   const setActiveTerminal = useCallback((workspaceId: string, terminalId: string) => {
-    setActiveTerminalIdByWorkspace((prev) => ({ ...prev, [workspaceId]: terminalId }));
+    setTerminalByWorkspace((prev) => {
+      const existing = prev[workspaceId];
+      if (!existing || existing.id === terminalId) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [workspaceId]: {
+          ...existing,
+          id: terminalId,
+        },
+      };
+    });
   }, []);
 
   const ensureTerminal = useCallback(
     (workspaceId: string) => {
-      const active = activeTerminalIdByWorkspace[workspaceId];
-      if (active) {
-        return active;
+      const existing = terminalByWorkspace[workspaceId];
+      if (existing) {
+        return existing.id;
       }
       return createTerminal(workspaceId);
     },
-    [activeTerminalIdByWorkspace, createTerminal],
+    [createTerminal, terminalByWorkspace],
   );
 
   const terminals = useMemo(() => {
     if (!activeWorkspaceId) {
       return [];
     }
-    return (tabsByWorkspace[activeWorkspaceId] ?? []).map(({ id, title }) => ({
-      id,
-      title,
-    }));
-  }, [activeWorkspaceId, tabsByWorkspace]);
+    const terminal = terminalByWorkspace[activeWorkspaceId];
+    return terminal ? [terminal] : [];
+  }, [activeWorkspaceId, terminalByWorkspace]);
 
   const activeTerminalId = useMemo(() => {
     if (!activeWorkspaceId) {
       return null;
     }
-    return activeTerminalIdByWorkspace[activeWorkspaceId] ?? null;
-  }, [activeTerminalIdByWorkspace, activeWorkspaceId]);
+    return terminalByWorkspace[activeWorkspaceId]?.id ?? null;
+  }, [activeWorkspaceId, terminalByWorkspace]);
 
   return {
     terminals,

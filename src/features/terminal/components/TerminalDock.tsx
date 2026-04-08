@@ -16,8 +16,6 @@ export function TerminalDock({
   isOpen,
   terminals,
   activeTerminalId,
-  onSelectTerminal,
-  onNewTerminal,
   onCloseTerminal,
   onResizeStart,
   terminalNode,
@@ -25,6 +23,8 @@ export function TerminalDock({
   if (!isOpen) {
     return null;
   }
+
+  const activeTitle = terminals[0]?.title ?? "Terminal";
 
   return (
     <section className="terminal-panel">
@@ -38,41 +38,20 @@ export function TerminalDock({
         />
       )}
       <div className="terminal-header">
-        <div className="terminal-tabs" role="tablist" aria-label="Terminal tabs">
-          {terminals.map((tab) => (
-            <button
-              key={tab.id}
-              className={`terminal-tab${
-                tab.id === activeTerminalId ? " active" : ""
-              }`}
-              type="button"
-              role="tab"
-              aria-selected={tab.id === activeTerminalId}
-              onClick={() => onSelectTerminal(tab.id)}
-            >
-              <span className="terminal-tab-label">{tab.title}</span>
-              <span
+        <div className="terminal-tabs" aria-label="Terminal">
+          <div className="terminal-tab active" aria-current="page">
+            <span className="terminal-tab-label">{activeTitle}</span>
+            {activeTerminalId && (
+              <button
                 className="terminal-tab-close"
-                role="button"
-                aria-label={`Close ${tab.title}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onCloseTerminal(tab.id);
-                }}
+                type="button"
+                aria-label={`Close ${activeTitle}`}
+                onClick={() => onCloseTerminal(activeTerminalId)}
               >
-                ×
-              </span>
-            </button>
-          ))}
-          <button
-            className="terminal-tab-add"
-            type="button"
-            onClick={onNewTerminal}
-            aria-label="New terminal"
-            title="New terminal"
-          >
-            +
-          </button>
+                x
+              </button>
+            )}
+          </div>
         </div>
       </div>
       <div className="terminal-body">{terminalNode}</div>
