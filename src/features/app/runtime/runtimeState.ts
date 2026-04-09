@@ -6,6 +6,9 @@ export type RuntimeAutomationState = {
   enabled: boolean;
   scopeKey: string;
   sourceName: string | null;
+  promptEnabled: boolean;
+  promptText: string;
+  promptSourceName: string | null;
   tasks: AutoTaskItem[];
   queueLength: number;
   pendingCount: number;
@@ -67,6 +70,9 @@ export function createRuntimeState({
       enabled: false,
       scopeKey: id,
       sourceName: null,
+      promptEnabled: false,
+      promptText: "",
+      promptSourceName: null,
       tasks: [],
       queueLength: 0,
       pendingCount: 0,

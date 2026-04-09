@@ -342,10 +342,22 @@ export const Composer = memo(function Composer({
       ),
   });
   const effectiveAutomationEnabled = automationController?.enabled ?? automationEnabled;
+  const effectiveAutomationPromptEnabled =
+    automationController?.promptEnabled ?? automationPromptEnabled;
+  const effectiveAutomationPromptText =
+    automationController?.promptText ?? automationPromptText;
+  const effectiveAutomationPromptSourceName =
+    automationController?.promptSourceName ?? automationPromptSourceName;
   const effectiveAutomationTasks = automationController?.tasks ?? automationTasks;
   const effectiveAutomationSummary = automationController?.summary ?? automationSummary;
   const setEffectiveAutomationEnabled =
     automationController?.setEnabled ?? setAutomationEnabled;
+  const setEffectiveAutomationPromptEnabled =
+    automationController?.setPromptEnabled ?? setAutomationPromptEnabled;
+  const setEffectiveAutomationPromptText =
+    automationController?.setPromptText ?? setAutomationPromptText;
+  const setEffectiveAutomationPromptSourceName =
+    automationController?.setPromptSourceName ?? setAutomationPromptSourceName;
   const appendEffectiveTasks = automationController?.appendTasks ?? appendTasks;
   const importEffectiveTasksFromText =
     automationController?.importTasksFromText ?? importTasksFromText;
@@ -511,6 +523,20 @@ export const Composer = memo(function Composer({
   }, [automationStorageKey]);
 
   useEffect(() => {
+    if (!automationController) {
+      return;
+    }
+    automationController.setPromptEnabled(automationPromptEnabled);
+    automationController.setPromptText(automationPromptText);
+    automationController.setPromptSourceName(automationPromptSourceName);
+  }, [
+    automationController,
+    automationPromptEnabled,
+    automationPromptSourceName,
+    automationPromptText,
+  ]);
+
+  useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
@@ -518,9 +544,9 @@ export const Composer = memo(function Composer({
       timeoutSeconds: automationTimeoutSeconds,
       pauseSeconds: automationPauseSeconds,
       directorySourceName: automationDirectorySourceName,
-      promptEnabled: automationPromptEnabled,
-      promptText: automationPromptText,
-      promptSourceName: automationPromptSourceName,
+      promptEnabled: effectiveAutomationPromptEnabled,
+      promptText: effectiveAutomationPromptText,
+      promptSourceName: effectiveAutomationPromptSourceName,
       autoExportEnabled: automationAutoExportEnabled,
       downloadDirectory: automationDownloadDirectory,
     };
@@ -528,13 +554,13 @@ export const Composer = memo(function Composer({
   }, [
     automationAutoExportEnabled,
     automationDownloadDirectory,
-    automationPromptEnabled,
-    automationPromptSourceName,
-    automationPromptText,
     automationPauseSeconds,
     automationDirectorySourceName,
     automationStorageKey,
     automationTimeoutSeconds,
+    effectiveAutomationPromptEnabled,
+    effectiveAutomationPromptSourceName,
+    effectiveAutomationPromptText,
   ]);
 
   const handleAutomationFileChange = useCallback(
@@ -557,12 +583,17 @@ export const Composer = memo(function Composer({
         return;
       }
       const content = await file.text();
-      setAutomationPromptText(content.trim());
-      setAutomationPromptSourceName(file.name);
-      setAutomationPromptEnabled(content.trim().length > 0);
+      const trimmedContent = content.trim();
+      setEffectiveAutomationPromptText(trimmedContent);
+      setEffectiveAutomationPromptSourceName(file.name);
+      setEffectiveAutomationPromptEnabled(trimmedContent.length > 0);
       event.target.value = "";
     },
-    [],
+    [
+      setEffectiveAutomationPromptEnabled,
+      setEffectiveAutomationPromptSourceName,
+      setEffectiveAutomationPromptText,
+    ],
   );
 
   const handleAutomationDirectoryPick = useCallback(async () => {
@@ -841,8 +872,8 @@ export const Composer = memo(function Composer({
         pauseSeconds={automationPauseSeconds}
         sourceName={effectiveAutomationSummary.sourceName}
         directorySourceName={automationDirectorySourceName}
-        promptSourceName={automationPromptSourceName}
-        promptEnabled={automationPromptEnabled}
+        promptSourceName={effectiveAutomationPromptSourceName}
+        promptEnabled={effectiveAutomationPromptEnabled}
         autoExportEnabled={automationAutoExportEnabled}
         downloadDirectory={automationDownloadDirectory}
         tasks={effectiveAutomationTasks}
@@ -850,7 +881,7 @@ export const Composer = memo(function Composer({
         fileInputRef={automationFileInputRef}
         promptFileInputRef={automationPromptFileInputRef}
         onToggleEnabled={setEffectiveAutomationEnabled}
-        onTogglePromptEnabled={setAutomationPromptEnabled}
+        onTogglePromptEnabled={setEffectiveAutomationPromptEnabled}
         onToggleAutoExportEnabled={setAutomationAutoExportEnabled}
         onOpenFilePicker={() => automationFileInputRef.current?.click()}
         onOpenDirectoryPicker={() => {

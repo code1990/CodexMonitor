@@ -55,6 +55,9 @@ describe("useRuntimeAutoTaskRunner", () => {
     const runtime = result.current.registry.runtimesById[result.current.runtimeId];
     expect(runtime.automation.scopeKey).toBe(result.current.runtimeId);
     expect(runtime.automation.enabled).toBe(true);
+    expect(runtime.automation.promptEnabled).toBe(false);
+    expect(runtime.automation.promptText).toBe("");
+    expect(runtime.automation.promptSourceName).toBeNull();
     expect(runtime.automation.queueLength).toBe(2);
     expect(runtime.automation.pendingCount).toBe(1);
     expect(runtime.automation.runningCount).toBe(1);
@@ -65,5 +68,49 @@ describe("useRuntimeAutoTaskRunner", () => {
       result.current.automation.clearAutomationTasks();
     });
     unmount();
+  });
+
+  it("persists runtime-scoped automation prompt settings", () => {
+    const onDispatchTask = vi.fn().mockResolvedValue(undefined);
+    const { result } = renderHook(() => {
+      const registry = useRuntimeRegistry();
+      const fallbackRuntimeRef = useRef(
+        createRuntimeState({
+          id: "runtime:ws-1:thread-1",
+          workspaceId: "ws-1",
+          threadId: "thread-1",
+        }),
+      );
+
+      useEffect(() => {
+        registry.openRuntime({ workspaceId: "ws-1", threadId: "thread-1" });
+      }, [registry.openRuntime]);
+
+      const runtime = registry.activeRuntime ?? fallbackRuntimeRef.current;
+      const automation = useRuntimeAutoTaskRunner({
+        runtime,
+        updateRuntime: registry.updateRuntime,
+        isBlocked: false,
+        timeoutMs: 10_000,
+        pauseAfterCompletionMs: 0,
+        onDispatchTask,
+      });
+      return {
+        registry,
+        runtimeId: runtime.id,
+        automation,
+      };
+    });
+
+    act(() => {
+      result.current.automation.setPromptText("prefix text");
+      result.current.automation.setPromptSourceName("prompt.txt");
+      result.current.automation.setPromptEnabled(true);
+    });
+
+    const runtime = result.current.registry.runtimesById[result.current.runtimeId];
+    expect(runtime.automation.promptText).toBe("prefix text");
+    expect(runtime.automation.promptSourceName).toBe("prompt.txt");
+    expect(runtime.automation.promptEnabled).toBe(true);
   });
 });

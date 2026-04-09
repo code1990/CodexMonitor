@@ -134,9 +134,15 @@ export function useRuntimeHost({
     automation: runtimeId
       ? {
           enabled: runtime?.automation.enabled ?? false,
+          promptEnabled: runtime?.automation.promptEnabled ?? false,
+          promptText: runtime?.automation.promptText ?? "",
+          promptSourceName: runtime?.automation.promptSourceName ?? null,
           tasks: automationController.tasks,
           summary: automationController.summary,
           setEnabled: automationController.setAutomationEnabled,
+          setPromptEnabled: automationController.setPromptEnabled,
+          setPromptText: automationController.setPromptText,
+          setPromptSourceName: automationController.setPromptSourceName,
           importTasks: automationController.importTasks,
           appendTasks: automationController.appendTasks,
           importTasksFromText: automationController.importTasksFromText,

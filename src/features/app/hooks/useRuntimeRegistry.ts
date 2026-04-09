@@ -16,7 +16,13 @@ type OpenRuntimeInput = {
   threadId?: string | null;
 };
 
-type UpdateRuntimeInput = Partial<Omit<RuntimeState, "id" | "createdAt">>;
+type UpdateRuntimeInput = Partial<
+  Omit<RuntimeState, "id" | "createdAt" | "view" | "execution" | "automation">
+> & {
+  view?: Partial<RuntimeState["view"]>;
+  execution?: Partial<RuntimeState["execution"]>;
+  automation?: Partial<RuntimeState["automation"]>;
+};
 
 function createRuntimeId({ workspaceId, threadId }: OpenRuntimeInput) {
   const suffix = threadId?.trim() ? threadId.trim() : "__draft__";

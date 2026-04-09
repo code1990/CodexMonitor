@@ -1410,7 +1410,11 @@ export default function MainApp() {
           threadId: targetThreadId,
         });
       }
-      await sendUserMessageToThread(workspace, targetThreadId, text, []);
+      const promptPrefix = runtime.automation.promptEnabled
+        ? runtime.automation.promptText.trim()
+        : "";
+      const messageText = promptPrefix ? `${promptPrefix}\n\n${text}` : text;
+      await sendUserMessageToThread(workspace, targetThreadId, messageText, []);
     },
     [
       connectWorkspace,

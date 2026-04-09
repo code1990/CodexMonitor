@@ -9,7 +9,13 @@ type UseRuntimeAutoTaskRunnerArgs = {
   runtime: RuntimeState;
   updateRuntime: (
     runtimeId: RuntimeId,
-    patch: Partial<Omit<RuntimeState, "id" | "createdAt">>,
+    patch: Partial<
+      Omit<RuntimeState, "id" | "createdAt" | "view" | "execution" | "automation">
+    > & {
+      view?: Partial<RuntimeState["view"]>;
+      execution?: Partial<RuntimeState["execution"]>;
+      automation?: Partial<RuntimeState["automation"]>;
+    },
   ) => void;
   isBlocked: boolean;
   timeoutMs: number;
@@ -41,6 +47,9 @@ export function useRuntimeAutoTaskRunner({
         scopeKey: runtime.automation.scopeKey,
         enabled: runtime.automation.enabled,
         sourceName: runner.summary.sourceName,
+        promptEnabled: runtime.automation.promptEnabled,
+        promptText: runtime.automation.promptText,
+        promptSourceName: runtime.automation.promptSourceName,
         tasks: runner.tasks,
         queueLength: runner.summary.total,
         pendingCount: runner.summary.pending,
@@ -72,12 +81,44 @@ export function useRuntimeAutoTaskRunner({
     (enabled: boolean) => {
       updateRuntime(runtime.id, {
         automation: {
-          ...runtime.automation,
           enabled,
         },
       });
     },
-    [runtime.automation, runtime.id, updateRuntime],
+    [runtime.id, updateRuntime],
+  );
+
+  const setPromptEnabled = useCallback(
+    (promptEnabled: boolean) => {
+      updateRuntime(runtime.id, {
+        automation: {
+          promptEnabled,
+        },
+      });
+    },
+    [runtime.id, updateRuntime],
+  );
+
+  const setPromptText = useCallback(
+    (promptText: string) => {
+      updateRuntime(runtime.id, {
+        automation: {
+          promptText,
+        },
+      });
+    },
+    [runtime.id, updateRuntime],
+  );
+
+  const setPromptSourceName = useCallback(
+    (promptSourceName: string | null) => {
+      updateRuntime(runtime.id, {
+        automation: {
+          promptSourceName,
+        },
+      });
+    },
+    [runtime.id, updateRuntime],
   );
 
   const importTasks = useCallback(
@@ -123,6 +164,9 @@ export function useRuntimeAutoTaskRunner({
   return {
     ...runner,
     setAutomationEnabled,
+    setPromptEnabled,
+    setPromptText,
+    setPromptSourceName,
     importTasks,
     appendTasks,
     importTasksFromText,

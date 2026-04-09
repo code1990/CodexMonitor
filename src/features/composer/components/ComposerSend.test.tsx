@@ -10,6 +10,7 @@ import type {
   ComposerSendIntent,
   FollowUpMessageBehavior,
 } from "../../../types";
+import type { RuntimeAutomationController } from "@app/runtime/runtimeHost";
 
 vi.mock("../../../services/dragDrop", () => ({
   subscribeWindowDragDrop: vi.fn(() => () => {}),
@@ -41,6 +42,7 @@ type HarnessProps = {
   followUpMessageBehavior?: FollowUpMessageBehavior;
   steerAvailable?: boolean;
   selectedServiceTier?: "fast" | "flex" | null;
+  automationController?: RuntimeAutomationController | null;
 };
 
 function ComposerHarness({
@@ -50,6 +52,7 @@ function ComposerHarness({
   followUpMessageBehavior = "queue",
   steerAvailable = false,
   selectedServiceTier = null,
+  automationController = null,
 }: HarnessProps) {
   const [draftText, setDraftText] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -85,6 +88,7 @@ function ComposerHarness({
       onDraftChange={setDraftText}
       textareaRef={textareaRef}
       dictationEnabled={false}
+      automationController={automationController}
     />
   );
 }
@@ -312,5 +316,63 @@ describe("Composer send triggers", () => {
     expect(await screen.findByText("task one")).toBeTruthy();
     expect(onSend).toHaveBeenCalledTimes(1);
     expect(onSend).toHaveBeenCalledWith("task one", [], undefined, "default");
+  });
+
+  it("syncs prompt txt selection into the runtime automation controller", async () => {
+    const onSend = vi.fn();
+    const automationController: RuntimeAutomationController = {
+      enabled: false,
+      promptEnabled: false,
+      promptText: "",
+      promptSourceName: null,
+      tasks: [],
+      summary: {
+        sourceName: null,
+        total: 0,
+        pending: 0,
+        running: 0,
+        completed: 0,
+        failed: 0,
+        timedOut: 0,
+        hasTerminalIssue: false,
+        activeTaskId: null,
+      },
+      setEnabled: vi.fn(),
+      setPromptEnabled: vi.fn(),
+      setPromptText: vi.fn(),
+      setPromptSourceName: vi.fn(),
+      importTasks: vi.fn(),
+      appendTasks: vi.fn(),
+      importTasksFromText: vi.fn(),
+      clearAutomationTasks: vi.fn(),
+    };
+    const { container } = render(
+      <ComposerHarness onSend={onSend} automationController={automationController} />,
+    );
+
+    const fileInputs = container.querySelectorAll(
+      ".composer-automation-file",
+    ) as NodeListOf<HTMLInputElement>;
+    const promptFileInput = fileInputs[1];
+    expect(promptFileInput).toBeTruthy();
+
+    const file = new File(["system prefix"], "prompt.txt", {
+      type: "text/plain",
+    });
+    Object.defineProperty(file, "text", {
+      value: vi.fn().mockResolvedValue("system prefix"),
+    });
+
+    await act(async () => {
+      fireEvent.change(promptFileInput, {
+        target: {
+          files: [file],
+        },
+      });
+    });
+
+    expect(automationController.setPromptText).toHaveBeenCalledWith("system prefix");
+    expect(automationController.setPromptSourceName).toHaveBeenCalledWith("prompt.txt");
+    expect(automationController.setPromptEnabled).toHaveBeenCalledWith(true);
   });
 });
