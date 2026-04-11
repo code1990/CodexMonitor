@@ -5,6 +5,7 @@ type ComposerAutomationPanelProps = {
   enabled: boolean;
   busy: boolean;
   blocked: boolean;
+  canClear: boolean;
   timeoutSeconds: number;
   pauseSeconds: number;
   sourceName: string | null;
@@ -85,6 +86,7 @@ export function ComposerAutomationPanel({
   enabled,
   busy,
   blocked,
+  canClear,
   timeoutSeconds,
   pauseSeconds,
   sourceName,
@@ -164,7 +166,7 @@ export function ComposerAutomationPanel({
           <button
             type="button"
             className="ghost"
-            disabled={summary.total === 0}
+            disabled={!canClear}
             onClick={onClear}
           >
             Clear

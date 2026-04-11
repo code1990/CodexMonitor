@@ -84,6 +84,10 @@ function looksLikeAbsoluteTextFilePath(path: string): boolean {
   return isAbsolute && /\.txt$/i.test(normalized);
 }
 
+function hasMeaningfulValue(value: string | null | undefined): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 type ComposerProps = {
   onSend: (
     text: string,
@@ -392,6 +396,14 @@ export const Composer = memo(function Composer({
     automationController?.importTasksFromText ?? importTasksFromText;
   const clearEffectiveAutomationTasks =
     automationController?.clearAutomationTasks ?? clearAutomationTasks;
+  const canClearAutomation =
+    hasMeaningfulValue(effectiveAutomationSummary.sourceName) ||
+    hasMeaningfulValue(automationDirectorySourceName) ||
+    hasMeaningfulValue(effectiveAutomationPromptSourceName) ||
+    hasMeaningfulValue(automationDownloadDirectory) ||
+    effectiveAutomationPromptEnabled ||
+    automationAutoExportEnabled ||
+    effectiveAutomationEnabled;
   const setComposerText = useCallback(
     (next: string) => {
       setText(next);
@@ -709,10 +721,21 @@ export const Composer = memo(function Composer({
 
   const handleClearAutomation = useCallback(() => {
     setEffectiveAutomationEnabled(false);
+    setEffectiveAutomationPromptEnabled(false);
+    setEffectiveAutomationPromptText("");
+    setEffectiveAutomationPromptSourceName(null);
+    setAutomationAutoExportEnabled(false);
+    setAutomationDownloadDirectory(null);
     clearEffectiveAutomationTasks();
     exportedAutomationTaskIdsRef.current = new Set();
     setAutomationDirectorySourceName(null);
-  }, [clearEffectiveAutomationTasks, setEffectiveAutomationEnabled]);
+  }, [
+    clearEffectiveAutomationTasks,
+    setEffectiveAutomationEnabled,
+    setEffectiveAutomationPromptEnabled,
+    setEffectiveAutomationPromptSourceName,
+    setEffectiveAutomationPromptText,
+  ]);
 
   const getLastAssistantMessage = useCallback((items: ConversationItem[]) => {
     for (let index = items.length - 1; index >= 0; index -= 1) {
@@ -949,6 +972,7 @@ export const Composer = memo(function Composer({
         enabled={effectiveAutomationEnabled}
         busy={isProcessing}
         blocked={disabled}
+        canClear={canClearAutomation}
         timeoutSeconds={automationTimeoutSeconds}
         pauseSeconds={automationPauseSeconds}
         sourceName={effectiveAutomationSummary.sourceName}

@@ -424,4 +424,36 @@ describe("Composer send triggers", () => {
     expect(screen.getByText("Prompt: json.txt")).toBeTruthy();
     expect(screen.getByLabelText("Use prompt TXT")).toHaveProperty("checked", true);
   });
+
+  it("keeps Clear enabled when only prompt/download state has values and clears them all", async () => {
+    const onSend = vi.fn();
+    tauriMocks.readTextFileMock.mockResolvedValue("system prefix");
+    tauriMocks.pickDirectoryMock.mockResolvedValue("C:\\Users\\htzl\\Pictures");
+    const clipboardReadText = vi.fn().mockResolvedValue("C:\\Users\\htzl\\Desktop\\flow.txt");
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { readText: clipboardReadText },
+    });
+
+    render(<ComposerHarness onSend={onSend} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Prompt TXT"));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Download Dir"));
+    });
+
+    const clearButton = screen.getByText("Clear");
+    expect(clearButton.hasAttribute("disabled")).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(clearButton);
+    });
+
+    expect(screen.getByText("Prompt: -")).toBeTruthy();
+    expect(screen.getByText("Download: -")).toBeTruthy();
+    expect(screen.getByLabelText("Use prompt TXT")).toHaveProperty("checked", false);
+    expect(screen.getByLabelText("Auto")).toHaveProperty("checked", false);
+  });
 });
