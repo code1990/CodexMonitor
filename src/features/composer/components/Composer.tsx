@@ -579,8 +579,23 @@ export const Composer = memo(function Composer({
     );
   }, [appendTasks]);
 
+  const canClearAutomation =
+    automationSummary.total > 0 ||
+    automationEnabled ||
+    automationPromptEnabled ||
+    automationAutoExportEnabled ||
+    automationPromptText.trim().length > 0 ||
+    Boolean(automationDirectorySourceName) ||
+    Boolean(automationPromptSourceName) ||
+    Boolean(automationDownloadDirectory);
+
   const handleClearAutomation = useCallback(() => {
     setAutomationEnabled(false);
+    setAutomationPromptEnabled(false);
+    setAutomationPromptText("");
+    setAutomationPromptSourceName(null);
+    setAutomationAutoExportEnabled(false);
+    setAutomationDownloadDirectory(null);
     clearAutomationTasks();
     exportedAutomationTaskIdsRef.current = new Set();
     setAutomationDirectorySourceName(null);
@@ -849,6 +864,7 @@ export const Composer = memo(function Composer({
         }}
         onFileChange={handleAutomationFileChange}
         onPromptFileChange={handleAutomationPromptFileChange}
+        canClear={canClearAutomation}
         onClear={handleClearAutomation}
         conversationHidden={conversationHidden}
         onToggleConversationHidden={onToggleConversationHidden}

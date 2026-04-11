@@ -34,6 +34,7 @@ type ComposerAutomationPanelProps = {
   onPickDownloadDirectory: () => void | Promise<void>;
   onFileChange: (event: ChangeEvent<HTMLInputElement>) => void | Promise<void>;
   onPromptFileChange: (event: ChangeEvent<HTMLInputElement>) => void | Promise<void>;
+  canClear: boolean;
   onClear: () => void;
   conversationHidden?: boolean;
   onToggleConversationHidden?: () => void;
@@ -106,6 +107,7 @@ export function ComposerAutomationPanel({
   onPickDownloadDirectory,
   onFileChange,
   onPromptFileChange,
+  canClear,
   onClear,
   conversationHidden = false,
   onToggleConversationHidden,
@@ -164,7 +166,7 @@ export function ComposerAutomationPanel({
           <button
             type="button"
             className="ghost"
-            disabled={summary.total === 0}
+            disabled={!canClear}
             onClick={onClear}
           >
             Clear

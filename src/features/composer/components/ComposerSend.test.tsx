@@ -10,6 +10,11 @@ import type {
   ComposerSendIntent,
   FollowUpMessageBehavior,
 } from "../../../types";
+import {
+  listTextFilesInDirectory,
+  pickDirectory,
+  writeTextFile,
+} from "../../../services/tauri";
 
 vi.mock("../../../services/dragDrop", () => ({
   subscribeWindowDragDrop: vi.fn(() => () => {}),
@@ -28,6 +33,12 @@ vi.mock("../../../utils/platformPaths", async () => {
     isMobilePlatform: vi.fn(() => false),
   };
 });
+
+vi.mock("../../../services/tauri", () => ({
+  listTextFilesInDirectory: vi.fn(),
+  pickDirectory: vi.fn(),
+  writeTextFile: vi.fn(),
+}));
 
 type HarnessProps = {
   onSend: (
@@ -93,6 +104,9 @@ describe("Composer send triggers", () => {
   afterEach(() => {
     cleanup();
     vi.mocked(isMobilePlatform).mockReturnValue(false);
+    vi.mocked(listTextFilesInDirectory).mockReset();
+    vi.mocked(pickDirectory).mockReset();
+    vi.mocked(writeTextFile).mockReset();
     vi.restoreAllMocks();
   });
 
@@ -312,5 +326,77 @@ describe("Composer send triggers", () => {
     expect(await screen.findByText("task one")).toBeTruthy();
     expect(onSend).toHaveBeenCalledTimes(1);
     expect(onSend).toHaveBeenCalledWith("task one", [], undefined, "default");
+  });
+
+  it("clears prompt, download, tasks, and automation toggles together", async () => {
+    const onSend = vi.fn();
+    vi.mocked(pickDirectory).mockResolvedValue("C:\\Users\\htzl\\Pictures");
+    const { container } = render(<ComposerHarness onSend={onSend} />);
+
+    const fileInputs = Array.from(
+      container.querySelectorAll(".composer-automation-file"),
+    ) as HTMLInputElement[];
+    expect(fileInputs).toHaveLength(2);
+
+    const tasksFile = new File(["task one"], "tasks.txt", { type: "text/plain" });
+    Object.defineProperty(tasksFile, "text", {
+      value: vi.fn().mockResolvedValue("task one"),
+    });
+    const promptFile = new File(["system prompt"], "flow.txt", { type: "text/plain" });
+    Object.defineProperty(promptFile, "text", {
+      value: vi.fn().mockResolvedValue("system prompt"),
+    });
+
+    await act(async () => {
+      fireEvent.change(fileInputs[0]!, {
+        target: {
+          files: [tasksFile],
+        },
+      });
+    });
+
+    await act(async () => {
+      fireEvent.change(fileInputs[1]!, {
+        target: {
+          files: [promptFile],
+        },
+      });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Download Dir" }));
+    });
+
+    const autoCheckbox = screen.getByLabelText("Auto") as HTMLInputElement;
+    const promptCheckbox = screen.getByLabelText("Use prompt TXT") as HTMLInputElement;
+    const autoExportCheckbox = screen.getByLabelText("Auto export") as HTMLInputElement;
+
+    expect(
+      (screen.getByRole("button", { name: "Clear" }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(screen.getByText("Prompt: flow.txt")).toBeTruthy();
+    expect(screen.getByText("Download: C:\\Users\\htzl\\Pictures")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(autoCheckbox);
+      fireEvent.click(autoExportCheckbox);
+    });
+
+    expect(autoCheckbox.checked).toBe(true);
+    expect(promptCheckbox.checked).toBe(true);
+    expect(autoExportCheckbox.checked).toBe(true);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    });
+
+    expect(autoCheckbox.checked).toBe(false);
+    expect(promptCheckbox.checked).toBe(false);
+    expect(autoExportCheckbox.checked).toBe(false);
+    expect(screen.getByText("Tasks: -")).toBeTruthy();
+    expect(screen.getByText("MD dir: -")).toBeTruthy();
+    expect(screen.getByText("Prompt: -")).toBeTruthy();
+    expect(screen.getByText("Download: -")).toBeTruthy();
+    expect(screen.queryByText("task one")).toBeNull();
   });
 });
