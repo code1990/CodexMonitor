@@ -144,6 +144,13 @@ export async function writeTextFile(path: string, content: string): Promise<void
   await invoke("write_text_file", { path: sanitizeExternalPath(path), content });
 }
 
+export async function moveTextFile(sourcePath: string, destinationPath: string): Promise<string> {
+  return invoke("move_text_file", {
+    sourcePath: sanitizeExternalPath(sourcePath),
+    destinationPath: sanitizeExternalPath(destinationPath),
+  });
+}
+
 export async function readTextFile(path: string): Promise<string> {
   return invoke("read_text_file", { path: sanitizeExternalPath(path) });
 }

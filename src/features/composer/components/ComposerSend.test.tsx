@@ -8,6 +8,7 @@ import type {
   AppOption,
   AppMention,
   ComposerSendIntent,
+  ConversationItem,
   FollowUpMessageBehavior,
 } from "../../../types";
 import type { RuntimeAutomationController } from "@app/runtime/runtimeHost";
@@ -18,6 +19,7 @@ const tauriMocks = vi.hoisted(() => ({
   readTextFileMock: vi.fn(async () => ""),
   listTextFilesInDirectoryMock: vi.fn(async () => []),
   writeTextFileMock: vi.fn(async () => undefined),
+  moveTextFileMock: vi.fn(async () => ""),
 }));
 
 vi.mock("../../../services/dragDrop", () => ({
@@ -30,6 +32,7 @@ vi.mock("../../../services/tauri", () => ({
   readTextFile: tauriMocks.readTextFileMock,
   listTextFilesInDirectory: tauriMocks.listTextFilesInDirectoryMock,
   writeTextFile: tauriMocks.writeTextFileMock,
+  moveTextFile: tauriMocks.moveTextFileMock,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -59,6 +62,7 @@ type HarnessProps = {
   steerAvailable?: boolean;
   selectedServiceTier?: "fast" | "flex" | null;
   automationController?: RuntimeAutomationController | null;
+  automationConversationItems?: ConversationItem[];
 };
 
 function ComposerHarness({
@@ -69,6 +73,7 @@ function ComposerHarness({
   steerAvailable = false,
   selectedServiceTier = null,
   automationController = null,
+  automationConversationItems = [],
 }: HarnessProps) {
   const [draftText, setDraftText] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -105,6 +110,7 @@ function ComposerHarness({
       textareaRef={textareaRef}
       dictationEnabled={false}
       automationController={automationController}
+      automationConversationItems={automationConversationItems}
     />
   );
 }
@@ -118,11 +124,13 @@ describe("Composer send triggers", () => {
     tauriMocks.readTextFileMock.mockReset();
     tauriMocks.listTextFilesInDirectoryMock.mockReset();
     tauriMocks.writeTextFileMock.mockReset();
+    tauriMocks.moveTextFileMock.mockReset();
     tauriMocks.pickDirectoryMock.mockResolvedValue(null);
     tauriMocks.pickTextFileMock.mockResolvedValue(null);
     tauriMocks.readTextFileMock.mockResolvedValue("");
     tauriMocks.listTextFilesInDirectoryMock.mockResolvedValue([]);
     tauriMocks.writeTextFileMock.mockResolvedValue(undefined);
+    tauriMocks.moveTextFileMock.mockResolvedValue("");
     vi.restoreAllMocks();
   });
 
@@ -520,5 +528,87 @@ describe("Composer send triggers", () => {
     expect(promptEnabledCalls[promptEnabledCalls.length - 1]).toEqual([false]);
     expect(promptEnabledCalls.some((args) => args[0] === true)).toBe(true);
     expect(promptEnabledCalls.slice(-1)[0][0]).toBe(false);
+  });
+
+  it("moves the completed source file into a task-named subfolder after auto export", async () => {
+    const onSend = vi.fn();
+    tauriMocks.pickDirectoryMock
+      .mockResolvedValueOnce(
+        "D:\\BaiduNetdiskDownload\\287-100551601-专栏课-邓明-后端工程师的高阶面经（完结）",
+      )
+      .mockResolvedValueOnce("C:\\Users\\htzl\\Pictures");
+    tauriMocks.listTextFilesInDirectoryMock.mockResolvedValue([
+      {
+        name: "001.md",
+        path: "D:\\BaiduNetdiskDownload\\287-100551601-专栏课-邓明-后端工程师的高阶面经（完结）\\001.md",
+        content: "task one",
+      },
+    ]);
+
+    const { rerender } = render(
+      <ComposerHarness
+        onSend={onSend}
+        isProcessing={false}
+        automationConversationItems={[
+          {
+            kind: "message",
+            role: "assistant",
+            text: "# exported markdown",
+          } as ConversationItem,
+        ]}
+      />,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("MD Dir"));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Download Dir"));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Auto export"));
+      fireEvent.click(screen.getByLabelText("Auto"));
+    });
+
+    expect(onSend).toHaveBeenCalledWith("task one", [], undefined, "default");
+
+    await act(async () => {
+      rerender(
+        <ComposerHarness
+          onSend={onSend}
+          isProcessing={true}
+          automationConversationItems={[
+            {
+              kind: "message",
+              role: "assistant",
+              text: "# exported markdown",
+            } as ConversationItem,
+          ]}
+        />,
+      );
+    });
+    await act(async () => {
+      rerender(
+        <ComposerHarness
+          onSend={onSend}
+          isProcessing={false}
+          automationConversationItems={[
+            {
+              kind: "message",
+              role: "assistant",
+              text: "# exported markdown",
+            } as ConversationItem,
+          ]}
+        />,
+      );
+    });
+
+    await vi.waitFor(() => {
+      expect(tauriMocks.writeTextFileMock).toHaveBeenCalledTimes(1);
+      expect(tauriMocks.moveTextFileMock).toHaveBeenCalledWith(
+        "D:\\BaiduNetdiskDownload\\287-100551601-专栏课-邓明-后端工程师的高阶面经（完结）\\001.md",
+        "C:\\Users\\htzl\\Pictures/287-100551601-专栏课-邓明-后端工程师的高阶面经（完结）/001.md",
+      );
+    });
   });
 });

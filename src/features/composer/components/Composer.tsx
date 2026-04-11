@@ -51,6 +51,7 @@ import type { CodexArgsOption } from "../../threads/utils/codexArgsProfiles";
 import type { RuntimeAutomationController } from "@app/runtime/runtimeHost";
 import {
   listTextFilesInDirectory,
+  moveTextFile,
   pickDirectory,
   pickTextFile,
   readTextFile,
@@ -86,6 +87,10 @@ function looksLikeAbsoluteTextFilePath(path: string): boolean {
 
 function hasMeaningfulValue(value: string | null | undefined): boolean {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function sanitizePathSegment(value: string): string {
+  return value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").replace(/[. ]+$/g, "");
 }
 
 type ComposerProps = {
@@ -778,12 +783,30 @@ export const Composer = memo(function Composer({
       completedTask.exportFileName?.trim() ||
       `${timestamp}-${safeWorkspace}-${safeThread}-task-${completedTask.lineNumber}.md`;
     const path = `${automationDownloadDirectory.replace(/[\\/]+$/, "")}/${fileName}`;
-    void writeTextFile(path, assistantContent);
+    void (async () => {
+      await writeTextFile(path, assistantContent);
+      if (
+        hasMeaningfulValue(completedTask.sourcePath) &&
+        hasMeaningfulValue(effectiveAutomationSummary.sourceName)
+      ) {
+        const sourceFileName = extractFileNameFromPath(completedTask.sourcePath ?? "");
+        const sourceFolderName = sanitizePathSegment(
+          effectiveAutomationSummary.sourceName ?? "",
+        );
+        if (sourceFileName && sourceFolderName) {
+          const destinationPath = `${automationDownloadDirectory.replace(/[\\/]+$/, "")}/${sourceFolderName}/${sourceFileName}`;
+          await moveTextFile(completedTask.sourcePath ?? "", destinationPath);
+        }
+      }
+    })().catch((error) => {
+      console.error("Failed to export automation task output", error);
+    });
   }, [
     automationAutoExportEnabled,
     automationConversationItems,
     automationDownloadDirectory,
     effectiveAutomationTasks,
+    effectiveAutomationSummary.sourceName,
     automationThreadId,
     automationWorkspaceId,
     getLastAssistantMessage,

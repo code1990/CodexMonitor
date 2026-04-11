@@ -189,6 +189,7 @@ pub fn run() {
             files::file_write,
             files::read_image_as_data_url,
             files::write_text_file,
+            files::move_text_file,
             files::read_text_file,
             files::list_text_files_in_directory,
             codex::get_config_model,

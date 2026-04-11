@@ -1,5 +1,5 @@
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, State};
 
 use self::io::TextFileResponse;
@@ -36,6 +36,36 @@ fn sanitize_user_path(path: &str) -> String {
         .trim_matches(|ch| ch == '"' || ch == '\'')
         .trim()
         .to_string()
+}
+
+fn ensure_unique_destination_path(destination: &Path) -> PathBuf {
+    if !destination.exists() {
+        return destination.to_path_buf();
+    }
+
+    let parent = destination
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let stem = destination
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("file");
+    let extension = destination.extension().and_then(|value| value.to_str());
+
+    for index in 1.. {
+        let candidate_name = match extension {
+            Some(ext) if !ext.is_empty() => format!("{stem} ({index}).{ext}"),
+            _ => format!("{stem} ({index})"),
+        };
+        let candidate = parent.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    destination.to_path_buf()
 }
 
 #[derive(serde::Serialize)]
@@ -157,6 +187,39 @@ pub(crate) fn write_text_file(path: String, content: String) -> Result<(), Strin
         }
     }
     std::fs::write(&target, content).map_err(|err| format!("Failed to write export file: {err}"))
+}
+
+#[tauri::command]
+pub(crate) fn move_text_file(source_path: String, destination_path: String) -> Result<String, String> {
+    let sanitized_source = sanitize_user_path(&source_path);
+    let sanitized_destination = sanitize_user_path(&destination_path);
+    let source = PathBuf::from(&sanitized_source);
+    let requested_destination = PathBuf::from(&sanitized_destination);
+    if source.as_os_str().is_empty() || requested_destination.as_os_str().is_empty() {
+        return Err("Source and destination paths are required".to_string());
+    }
+    if !source.is_file() {
+        return Err("Source file does not exist".to_string());
+    }
+
+    let target = ensure_unique_destination_path(&requested_destination);
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("Failed to create destination directory: {err}"))?;
+        }
+    }
+
+    match std::fs::rename(&source, &target) {
+        Ok(()) => Ok(target.to_string_lossy().to_string()),
+        Err(_) => {
+            std::fs::copy(&source, &target)
+                .map_err(|err| format!("Failed to copy source file: {err}"))?;
+            std::fs::remove_file(&source)
+                .map_err(|err| format!("Failed to remove original source file: {err}"))?;
+            Ok(target.to_string_lossy().to_string())
+        }
+    }
 }
 
 #[tauri::command]
