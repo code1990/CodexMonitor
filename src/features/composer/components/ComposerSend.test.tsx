@@ -456,4 +456,69 @@ describe("Composer send triggers", () => {
     expect(screen.getByLabelText("Use prompt TXT")).toHaveProperty("checked", false);
     expect(screen.getByLabelText("Auto")).toHaveProperty("checked", false);
   });
+
+  it("does not reapply stale prompt controller values after Clear", async () => {
+    const onSend = vi.fn();
+    const automationController: RuntimeAutomationController = {
+      enabled: false,
+      promptEnabled: false,
+      promptText: "",
+      promptSourceName: null,
+      tasks: [],
+      summary: {
+        sourceName: null,
+        total: 0,
+        pending: 0,
+        running: 0,
+        completed: 0,
+        failed: 0,
+        timedOut: 0,
+        hasTerminalIssue: false,
+        activeTaskId: null,
+      },
+      setEnabled: vi.fn(),
+      setPromptEnabled: vi.fn(),
+      setPromptText: vi.fn(),
+      setPromptSourceName: vi.fn(),
+      importTasks: vi.fn(),
+      appendTasks: vi.fn(),
+      importTasksFromText: vi.fn(),
+      clearAutomationTasks: vi.fn(),
+    };
+
+    const { rerender } = render(
+      <ComposerHarness onSend={onSend} automationController={automationController} />,
+    );
+
+    const promptFileInput = document.querySelectorAll(".composer-automation-file")[1] as
+      | HTMLInputElement
+      | undefined;
+    expect(promptFileInput).toBeTruthy();
+
+    const file = new File(["system prefix"], "prompt.txt", {
+      type: "text/plain",
+    });
+    Object.defineProperty(file, "text", {
+      value: vi.fn().mockResolvedValue("system prefix"),
+    });
+
+    await act(async () => {
+      fireEvent.change(promptFileInput!, {
+        target: {
+          files: [file],
+        },
+      });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Clear"));
+    });
+
+    rerender(<ComposerHarness onSend={onSend} automationController={automationController} />);
+
+    const promptEnabledCalls = vi.mocked(automationController.setPromptEnabled).mock.calls;
+    expect(promptEnabledCalls[promptEnabledCalls.length - 1]).toEqual([false]);
+    expect(promptEnabledCalls.some((args) => args[0] === true)).toBe(true);
+    expect(promptEnabledCalls.slice(-1)[0][0]).toBe(false);
+  });
 });

@@ -383,14 +383,6 @@ export const Composer = memo(function Composer({
     automationController?.promptSourceName ?? automationPromptSourceName;
   const effectiveAutomationTasks = automationController?.tasks ?? automationTasks;
   const effectiveAutomationSummary = automationController?.summary ?? automationSummary;
-  const setEffectiveAutomationEnabled =
-    automationController?.setEnabled ?? setAutomationEnabled;
-  const setEffectiveAutomationPromptEnabled =
-    automationController?.setPromptEnabled ?? setAutomationPromptEnabled;
-  const setEffectiveAutomationPromptText =
-    automationController?.setPromptText ?? setAutomationPromptText;
-  const setEffectiveAutomationPromptSourceName =
-    automationController?.setPromptSourceName ?? setAutomationPromptSourceName;
   const appendEffectiveTasks = automationController?.appendTasks ?? appendTasks;
   const importEffectiveTasksFromText =
     automationController?.importTasksFromText ?? importTasksFromText;
@@ -410,6 +402,34 @@ export const Composer = memo(function Composer({
       onDraftChange?.(next);
     },
     [onDraftChange],
+  );
+  const setEffectiveAutomationEnabled = useCallback(
+    (enabled: boolean) => {
+      setAutomationEnabled(enabled);
+      automationController?.setEnabled(enabled);
+    },
+    [automationController],
+  );
+  const setEffectiveAutomationPromptEnabled = useCallback(
+    (enabled: boolean) => {
+      setAutomationPromptEnabled(enabled);
+      automationController?.setPromptEnabled(enabled);
+    },
+    [automationController],
+  );
+  const setEffectiveAutomationPromptText = useCallback(
+    (value: string) => {
+      setAutomationPromptText(value);
+      automationController?.setPromptText(value);
+    },
+    [automationController],
+  );
+  const setEffectiveAutomationPromptSourceName = useCallback(
+    (value: string | null) => {
+      setAutomationPromptSourceName(value);
+      automationController?.setPromptSourceName(value);
+    },
+    [automationController],
   );
   const syncDraftText = useCallback((next: string) => {
     setText((prev) => (prev === next ? prev : next));
@@ -561,20 +581,6 @@ export const Composer = memo(function Composer({
       // Ignore invalid local state and fall back to defaults.
     }
   }, [automationStorageKey]);
-
-  useEffect(() => {
-    if (!automationController) {
-      return;
-    }
-    automationController.setPromptEnabled(automationPromptEnabled);
-    automationController.setPromptText(automationPromptText);
-    automationController.setPromptSourceName(automationPromptSourceName);
-  }, [
-    automationController,
-    automationPromptEnabled,
-    automationPromptSourceName,
-    automationPromptText,
-  ]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
