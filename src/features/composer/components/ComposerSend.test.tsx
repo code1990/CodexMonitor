@@ -12,8 +12,24 @@ import type {
 } from "../../../types";
 import type { RuntimeAutomationController } from "@app/runtime/runtimeHost";
 
+const tauriMocks = vi.hoisted(() => ({
+  pickDirectoryMock: vi.fn(async () => null),
+  pickTextFileMock: vi.fn(async () => null),
+  readTextFileMock: vi.fn(async () => ""),
+  listTextFilesInDirectoryMock: vi.fn(async () => []),
+  writeTextFileMock: vi.fn(async () => undefined),
+}));
+
 vi.mock("../../../services/dragDrop", () => ({
   subscribeWindowDragDrop: vi.fn(() => () => {}),
+}));
+
+vi.mock("../../../services/tauri", () => ({
+  pickDirectory: tauriMocks.pickDirectoryMock,
+  pickTextFile: tauriMocks.pickTextFileMock,
+  readTextFile: tauriMocks.readTextFileMock,
+  listTextFilesInDirectory: tauriMocks.listTextFilesInDirectoryMock,
+  writeTextFile: tauriMocks.writeTextFileMock,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -97,6 +113,16 @@ describe("Composer send triggers", () => {
   afterEach(() => {
     cleanup();
     vi.mocked(isMobilePlatform).mockReturnValue(false);
+    tauriMocks.pickDirectoryMock.mockReset();
+    tauriMocks.pickTextFileMock.mockReset();
+    tauriMocks.readTextFileMock.mockReset();
+    tauriMocks.listTextFilesInDirectoryMock.mockReset();
+    tauriMocks.writeTextFileMock.mockReset();
+    tauriMocks.pickDirectoryMock.mockResolvedValue(null);
+    tauriMocks.pickTextFileMock.mockResolvedValue(null);
+    tauriMocks.readTextFileMock.mockResolvedValue("");
+    tauriMocks.listTextFilesInDirectoryMock.mockResolvedValue([]);
+    tauriMocks.writeTextFileMock.mockResolvedValue(undefined);
     vi.restoreAllMocks();
   });
 
@@ -374,5 +400,28 @@ describe("Composer send triggers", () => {
     expect(automationController.setPromptText).toHaveBeenCalledWith("system prefix");
     expect(automationController.setPromptSourceName).toHaveBeenCalledWith("prompt.txt");
     expect(automationController.setPromptEnabled).toHaveBeenCalledWith(true);
+  });
+
+  it("loads prompt txt from a clipboard path copied from model output", async () => {
+    const onSend = vi.fn();
+    tauriMocks.readTextFileMock.mockResolvedValue("system prefix");
+    const clipboardReadText = vi.fn().mockResolvedValue("‪C:\\Users\\htzl\\Desktop\\json.txt");
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { readText: clipboardReadText },
+    });
+
+    render(<ComposerHarness onSend={onSend} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Prompt TXT"));
+    });
+
+    expect(clipboardReadText).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.readTextFileMock).toHaveBeenCalledWith(
+      "C:\\Users\\htzl\\Desktop\\json.txt",
+    );
+    expect(screen.getByText("Prompt: json.txt")).toBeTruthy();
+    expect(screen.getByLabelText("Use prompt TXT")).toHaveProperty("checked", true);
   });
 });

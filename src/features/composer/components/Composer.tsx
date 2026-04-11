@@ -52,8 +52,37 @@ import type { RuntimeAutomationController } from "@app/runtime/runtimeHost";
 import {
   listTextFilesInDirectory,
   pickDirectory,
+  pickTextFile,
+  readTextFile,
   writeTextFile,
 } from "../../../services/tauri";
+
+const PATH_CONTROL_CHARS_RE = /[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+function sanitizePastedPath(value: string): string {
+  return value
+    .replace(PATH_CONTROL_CHARS_RE, "")
+    .trim()
+    .replace(/^['"]+|['"]+$/g, "")
+    .trim();
+}
+
+function extractFileNameFromPath(path: string): string {
+  const segments = sanitizePastedPath(path).split(/[\\/]/).filter(Boolean);
+  return segments[segments.length - 1] ?? path;
+}
+
+function looksLikeAbsoluteTextFilePath(path: string): boolean {
+  const normalized = sanitizePastedPath(path);
+  if (!normalized) {
+    return false;
+  }
+  const isAbsolute =
+    /^[a-zA-Z]:[\\/]/.test(normalized) ||
+    /^\\\\/.test(normalized) ||
+    normalized.startsWith("/");
+  return isAbsolute && /\.txt$/i.test(normalized);
+}
 
 type ComposerProps = {
   onSend: (
@@ -363,7 +392,6 @@ export const Composer = memo(function Composer({
     automationController?.importTasksFromText ?? importTasksFromText;
   const clearEffectiveAutomationTasks =
     automationController?.clearAutomationTasks ?? clearAutomationTasks;
-
   const setComposerText = useCallback(
     (next: string) => {
       setText(next);
@@ -595,6 +623,59 @@ export const Composer = memo(function Composer({
       setEffectiveAutomationPromptText,
     ],
   );
+
+  const applyAutomationPromptContent = useCallback(
+    (sourceName: string, content: string) => {
+      const trimmedContent = content.trim();
+      setEffectiveAutomationPromptText(trimmedContent);
+      setEffectiveAutomationPromptSourceName(sourceName);
+      setEffectiveAutomationPromptEnabled(trimmedContent.length > 0);
+    },
+    [
+      setEffectiveAutomationPromptEnabled,
+      setEffectiveAutomationPromptSourceName,
+      setEffectiveAutomationPromptText,
+    ],
+  );
+
+  const tryLoadPromptFromClipboardPath = useCallback(async () => {
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.clipboard ||
+      typeof navigator.clipboard.readText !== "function"
+    ) {
+      return false;
+    }
+    try {
+      const clipboardText = await navigator.clipboard.readText();
+      const candidatePath = sanitizePastedPath(clipboardText);
+      if (!looksLikeAbsoluteTextFilePath(candidatePath)) {
+        return false;
+      }
+      const content = await readTextFile(candidatePath);
+      applyAutomationPromptContent(extractFileNameFromPath(candidatePath), content);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [applyAutomationPromptContent]);
+
+  const handleOpenAutomationPromptSource = useCallback(async () => {
+    if (await tryLoadPromptFromClipboardPath()) {
+      return;
+    }
+    try {
+      const selectedPath = await pickTextFile("Select prompt TXT", ["txt"]);
+      if (selectedPath) {
+        const content = await readTextFile(selectedPath);
+        applyAutomationPromptContent(extractFileNameFromPath(selectedPath), content);
+        return;
+      }
+    } catch {
+      // Fall through to the browser file input fallback when dialog access fails.
+    }
+    automationPromptFileInputRef.current?.click();
+  }, [applyAutomationPromptContent, tryLoadPromptFromClipboardPath]);
 
   const handleAutomationDirectoryPick = useCallback(async () => {
     const directory = await pickDirectory("Select markdown/text task folder");
@@ -887,7 +968,9 @@ export const Composer = memo(function Composer({
         onOpenDirectoryPicker={() => {
           void handleAutomationDirectoryPick();
         }}
-        onOpenPromptFilePicker={() => automationPromptFileInputRef.current?.click()}
+        onOpenPromptFilePicker={() => {
+          void handleOpenAutomationPromptSource();
+        }}
         onPickDownloadDirectory={async () => {
           const selection = await pickDirectory("Select automation export folder");
           if (selection) {

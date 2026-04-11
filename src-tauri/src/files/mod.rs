@@ -13,6 +13,31 @@ pub(crate) mod io;
 pub(crate) mod ops;
 pub(crate) mod policy;
 
+fn sanitize_user_path(path: &str) -> String {
+    path.chars()
+        .filter(|ch| {
+            !matches!(
+                ch,
+                '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'
+                    | '\u{202b}'
+                    | '\u{202c}'
+                    | '\u{202d}'
+                    | '\u{202e}'
+                    | '\u{2066}'
+                    | '\u{2067}'
+                    | '\u{2068}'
+                    | '\u{2069}'
+            )
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches(|ch| ch == '"' || ch == '\'')
+        .trim()
+        .to_string()
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DirectoryTextFileEntry {
@@ -120,7 +145,8 @@ pub(crate) async fn read_image_as_data_url(
 
 #[tauri::command]
 pub(crate) fn write_text_file(path: String, content: String) -> Result<(), String> {
-    let target = PathBuf::from(path.trim());
+    let sanitized_path = sanitize_user_path(&path);
+    let target = PathBuf::from(&sanitized_path);
     if target.as_os_str().is_empty() {
         return Err("Path is required".to_string());
     }
@@ -135,7 +161,8 @@ pub(crate) fn write_text_file(path: String, content: String) -> Result<(), Strin
 
 #[tauri::command]
 pub(crate) fn read_text_file(path: String) -> Result<String, String> {
-    let target = PathBuf::from(path.trim());
+    let sanitized_path = sanitize_user_path(&path);
+    let target = PathBuf::from(&sanitized_path);
     if target.as_os_str().is_empty() {
         return Err("Path is required".to_string());
     }
@@ -147,7 +174,8 @@ pub(crate) fn list_text_files_in_directory(
     directory: String,
     extensions: Vec<String>,
 ) -> Result<Vec<DirectoryTextFileEntry>, String> {
-    let dir = PathBuf::from(directory.trim());
+    let sanitized_directory = sanitize_user_path(&directory);
+    let dir = PathBuf::from(&sanitized_directory);
     if dir.as_os_str().is_empty() {
         return Err("Directory is required".to_string());
     }

@@ -29,6 +29,16 @@ import type {
   ReviewTarget,
 } from "../types";
 
+const BIDI_CONTROL_CHARS_RE = /[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+function sanitizeExternalPath(path: string): string {
+  return path
+    .replace(BIDI_CONTROL_CHARS_RE, "")
+    .trim()
+    .replace(/^['"]+|['"]+$/g, "")
+    .trim();
+}
+
 function isMissingTauriInvokeError(error: unknown) {
   return (
     error instanceof TypeError &&
@@ -59,6 +69,27 @@ export async function pickDirectory(title = "Select folder"): Promise<string | n
     return null;
   }
   return selection;
+}
+
+export async function pickTextFile(
+  title = "Select text file",
+  extensions: string[] = ["txt"],
+): Promise<string | null> {
+  const selection = await open({
+    directory: false,
+    multiple: false,
+    title,
+    filters: [
+      {
+        name: "Text files",
+        extensions,
+      },
+    ],
+  });
+  if (!selection || Array.isArray(selection)) {
+    return null;
+  }
+  return sanitizeExternalPath(selection);
 }
 
 export async function pickImageFiles(): Promise<string[]> {
@@ -110,11 +141,11 @@ export async function exportMarkdownFile(
 }
 
 export async function writeTextFile(path: string, content: string): Promise<void> {
-  await invoke("write_text_file", { path, content });
+  await invoke("write_text_file", { path: sanitizeExternalPath(path), content });
 }
 
 export async function readTextFile(path: string): Promise<string> {
-  return invoke("read_text_file", { path });
+  return invoke("read_text_file", { path: sanitizeExternalPath(path) });
 }
 
 export type DirectoryTextFileEntry = {
@@ -127,7 +158,10 @@ export async function listTextFilesInDirectory(
   directory: string,
   extensions: string[],
 ): Promise<DirectoryTextFileEntry[]> {
-  return invoke("list_text_files_in_directory", { directory, extensions });
+  return invoke("list_text_files_in_directory", {
+    directory: sanitizeExternalPath(directory),
+    extensions,
+  });
 }
 
 export async function listWorkspaces(): Promise<WorkspaceInfo[]> {
