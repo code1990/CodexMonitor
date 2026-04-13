@@ -111,6 +111,28 @@ export function useMessagesViewState({
   }, [scrollKey, isThinking, isNearBottom, threadId]);
 
   useEffect(() => {
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const container = containerRef.current;
+    const content = bottomRef.current?.parentElement;
+    if (!container || !content) {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      const shouldScroll =
+        autoScrollRef.current || (container ? isNearBottom(container) : true);
+      if (!shouldScroll) {
+        return;
+      }
+      container.scrollTop = container.scrollHeight;
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [isNearBottom, threadId]);
+
+  useEffect(() => {
     return () => {
       if (copyTimeoutRef.current) {
         window.clearTimeout(copyTimeoutRef.current);

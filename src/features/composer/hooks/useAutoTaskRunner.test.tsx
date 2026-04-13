@@ -131,4 +131,31 @@ describe("useAutoTaskRunner", () => {
     expect(result.current.tasks[0]?.status).toBe("timed_out");
     expect(result.current.summary.hasTerminalIssue).toBe(true);
   });
+
+  it("derives meaningful export filenames for txt-imported tasks", () => {
+    const onDispatchTask = vi.fn().mockResolvedValue(undefined);
+    const { result } = renderHook(() =>
+      useAutoTaskRunner({
+        enabled: false,
+        isProcessing: false,
+        isBlocked: false,
+        timeoutMs: 10_000,
+        pauseAfterCompletionMs: 0,
+        scopeKey: "workspace-1",
+        onDispatchTask,
+      }),
+    );
+
+    act(() => {
+      result.current.importTasksFromText(
+        "tasks.txt",
+        "Spring Cloud 微服务1. 你主导过哪些微服务模块？服务是怎么拆分的？\nsecond/task:name?",
+      );
+    });
+
+    expect(result.current.tasks[0]?.exportFileName).toBe(
+      "001-Spring Cloud 微服务1. 你主导过哪些微服务模块？服务是怎么拆分的？.md",
+    );
+    expect(result.current.tasks[1]?.exportFileName).toBe("002-second-task-name.md");
+  });
 });

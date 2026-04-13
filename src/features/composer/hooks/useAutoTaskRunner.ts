@@ -87,12 +87,29 @@ export type AutoTaskImportInput = {
   exportFileName?: string | null;
 };
 
+const MAX_EXPORT_BASENAME_LENGTH = 80;
+
+const buildTaskExportFileName = (lineNumber: number, text: string) => {
+  const prefix = String(lineNumber).padStart(3, "0");
+  const normalized = text
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[\\/:*?"<>|]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-.\s]+|[-.\s]+$/g, "")
+    .replace(/\.+$/g, "")
+    .trim();
+  const basename = normalized.slice(0, MAX_EXPORT_BASENAME_LENGTH).trim() || "task";
+  return `${prefix}-${basename}.md`;
+};
+
 const parseTasks = (content: string) =>
   content
     .split(/\r?\n/)
     .map((line, index) => ({
       text: line.trim(),
       lineNumber: index + 1,
+      exportFileName: buildTaskExportFileName(index + 1, line),
     }))
     .filter((line) => line.text.length > 0);
 
