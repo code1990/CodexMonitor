@@ -46,6 +46,7 @@
           <a href="#features">Features</a>
           <a href="#screens">Screens</a>
           <a href="#workflow">Workflow</a>
+          <a href="#docs">Docs</a>
           <a href="changelog.html">Changelog</a>
           <a href="#cta">Get started</a>
         </nav>
@@ -237,6 +238,43 @@
               <h3>Review + ship</h3>
               <p>Open diffs, logs, and reviews alongside your threads with instant context.</p>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="docs" class="section">
+        <div class="container">
+          <div class="section-title">
+            <h2>Documentation for deployment and remote service mode.</h2>
+            <p>Use these guides when you want Codex Monitor to run as a daemon-backed service, not only as a desktop app.</p>
+          </div>
+
+          <div class="feature-grid">
+            <article class="glass card">
+              <h3>API quickstart</h3>
+              <p>Minimal curl-based flow to start the daemon, submit a task, and watch SSE output.</p>
+              <a href="https://github.com/Dimillian/CodexMonitor/blob/main/docs/daemon-api-quickstart.md" target="_blank" rel="noreferrer">Open guide</a>
+            </article>
+            <article class="glass card">
+              <h3>RPC runbook</h3>
+              <p>Daemon lifecycle, `daemonctl`, auth handshake, and raw TCP JSON-RPC examples.</p>
+              <a href="https://github.com/Dimillian/CodexMonitor/blob/main/docs/daemon-rpc-runbook.md" target="_blank" rel="noreferrer">Open guide</a>
+            </article>
+            <article class="glass card">
+              <h3>Daemon deployment</h3>
+              <p>Build, package, and run the headless daemon with systemd and a reverse proxy.</p>
+              <a href="https://github.com/Dimillian/CodexMonitor/blob/main/docs/deploy-daemon.md" target="_blank" rel="noreferrer">Open guide</a>
+            </article>
+            <article class="glass card">
+              <h3>Service API</h3>
+              <p>Current HTTP and SSE routes, auth model, task lifecycle, and streaming behavior.</p>
+              <a href="https://github.com/Dimillian/CodexMonitor/blob/main/docs/daemon-service-api.md" target="_blank" rel="noreferrer">Open guide</a>
+            </article>
+            <article class="glass card">
+              <h3>Remote architecture</h3>
+              <p>How the daemon evolves into a standalone middleware layer for desktop, web, and mobile clients.</p>
+              <a href="https://github.com/Dimillian/CodexMonitor/blob/main/docs/remote-service-architecture.md" target="_blank" rel="noreferrer">Open guide</a>
+            </article>
           </div>
         </div>
       </section>

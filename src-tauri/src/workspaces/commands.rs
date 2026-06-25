@@ -222,6 +222,23 @@ pub(crate) async fn add_clone(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<WorkspaceInfo, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        let copies_folder = remote_backend::normalize_path_for_remote(copies_folder);
+        let request = workspace_rpc::AddCloneRequest {
+            source_workspace_id,
+            copy_name,
+            copies_folder,
+        };
+        let response = remote_backend::call_remote(
+            &*state,
+            app,
+            "add_clone",
+            workspace_remote_params(&request)?,
+        )
+        .await?;
+        return serde_json::from_value(response).map_err(|err| err.to_string());
+    }
+
     workspaces_core::add_clone_core(
         source_workspace_id,
         copy_name,
@@ -545,7 +562,20 @@ pub(crate) async fn rename_worktree_upstream(
 pub(crate) async fn apply_worktree_changes(
     workspace_id: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<(), String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        let request = workspace_rpc::WorkspaceIdRequest { workspace_id };
+        remote_backend::call_remote(
+            &*state,
+            app,
+            "apply_worktree_changes",
+            workspace_remote_params(&request)?,
+        )
+        .await?;
+        return Ok(());
+    }
+
     workspaces_core::apply_worktree_changes_core(&state.workspaces, workspace_id).await
 }
 
@@ -647,12 +677,50 @@ pub(crate) async fn open_workspace_in(
     command: Option<String>,
     line: Option<u32>,
     column: Option<u32>,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
 ) -> Result<(), String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        let path = remote_backend::normalize_path_for_remote(path);
+        let request = workspace_rpc::OpenWorkspaceInRequest {
+            path,
+            app,
+            args,
+            command,
+            line,
+            column,
+        };
+        remote_backend::call_remote(
+            &*state,
+            app_handle,
+            "open_workspace_in",
+            workspace_remote_params(&request)?,
+        )
+        .await?;
+        return Ok(());
+    }
+
     workspaces_core::open_workspace_in_core(path, app, args, command, line, column).await
 }
 
 #[tauri::command]
-pub(crate) async fn get_open_app_icon(app_name: String) -> Result<Option<String>, String> {
+pub(crate) async fn get_open_app_icon(
+    app_name: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<Option<String>, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        let request = workspace_rpc::GetOpenAppIconRequest { app_name };
+        let response = remote_backend::call_remote(
+            &*state,
+            app,
+            "get_open_app_icon",
+            workspace_remote_params(&request)?,
+        )
+        .await?;
+        return serde_json::from_value(response).map_err(|err| err.to_string());
+    }
+
     #[cfg(target_os = "macos")]
     {
         return workspaces_core::get_open_app_icon_core(app_name, |name| {

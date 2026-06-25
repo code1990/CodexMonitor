@@ -51,6 +51,7 @@ CodexMonitor is a Tauri app for orchestrating multiple Codex agents across local
 - Node.js + npm
 - Rust toolchain (stable)
 - CMake (required for native dependencies; dictation/Whisper uses it)
+- On Linux: `pkg-config` plus Tauri system libraries, including `glib-2.0 >= 2.70`, GTK3, and WebKitGTK 4.1
 - LLVM/Clang (required on Windows to build dictation dependencies via bindgen)
 - Codex CLI installed and available as `codex` in `PATH` (or configure a custom Codex binary in app/workspace settings)
 - Git CLI (used for worktree operations)
@@ -61,6 +62,16 @@ If you hit native build errors, run:
 ```bash
 npm run doctor
 ```
+
+Linux note:
+
+- `npm run doctor:strict` now checks the `glib-2.0` version required by the current Tauri stack.
+- On Ubuntu/Debian, install the same packages used in CI:
+
+```bash
+sudo apt-get install cmake pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libglib2.0-dev
+```
+- If your distro packages are too old for `glib-2.0 >= 2.70`, use `nix develop` for the supported build shell.
 
 ## Getting Started
 
@@ -107,12 +118,26 @@ Notes:
 
 Use the standalone daemon control CLI when you want iOS remote mode without keeping the desktop app open.
 
+For long-lived server deployment with `systemd` and reverse proxying, see [docs/deploy-daemon.md](/root/CodexMonitor/CodexMonitor/docs/deploy-daemon.md).
+
 Build binaries:
 
 ```bash
 cd src-tauri
 cargo build --bin codex_monitor_daemon --bin codex_monitor_daemonctl
 ```
+
+For a server-only deployment, prefer the headless daemon build/package path:
+
+```bash
+./scripts/build-daemon.sh
+./scripts/package-daemon.sh
+```
+
+This produces a standalone daemon artifact without the desktop Tauri bundle. Full deployment steps are in [docs/deploy-daemon.md](/root/CodexMonitor/CodexMonitor/docs/deploy-daemon.md).
+The fastest smoke-test path is [docs/daemon-api-quickstart.md](/root/CodexMonitor/CodexMonitor/docs/daemon-api-quickstart.md).
+The current HTTP/SSE route contract is documented in [docs/daemon-service-api.md](/root/CodexMonitor/CodexMonitor/docs/daemon-service-api.md).
+Daemon lifecycle and raw TCP JSON-RPC usage are documented in [docs/daemon-rpc-runbook.md](/root/CodexMonitor/CodexMonitor/docs/daemon-rpc-runbook.md).
 
 Examples:
 
@@ -134,9 +159,12 @@ Useful overrides:
 
 - `--data-dir <path>`: app data dir containing `settings.json` / `workspaces.json`
 - `--listen <addr>`: bind address override
+- `--http-listen <addr>`: optional thin HTTP bridge for remote submit / inspection helpers
 - `--token <token>`: token override
 - `--daemon-path <path>`: explicit `codex-monitor-daemon` binary path
 - `--json`: machine-readable output
+
+The daemon binary also supports an optional HTTP bridge. With `--http-listen` enabled, you can use endpoints such as `GET /health`, `GET /api/workspaces`, and `POST /api/task/submit` with the same auth token. See [REMOTE_BACKEND_POC.md](/root/CodexMonitor/CodexMonitor/REMOTE_BACKEND_POC.md) for the route list and curl example.
 
 ### iOS Prerequisites
 

@@ -69,9 +69,10 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ignore::WalkBuilder;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 
@@ -95,6 +96,7 @@ use workspace_settings::apply_workspace_settings_update;
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:4732";
 const MAX_IN_FLIGHT_RPC_PER_CONNECTION: usize = 32;
 const DAEMON_NAME: &str = "codex-monitor-daemon";
+const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 
 fn spawn_with_client(
     event_sink: DaemonEventSink,
@@ -122,6 +124,7 @@ struct DaemonEventSink {
 #[derive(Clone)]
 enum DaemonEvent {
     AppServer(AppServerEvent),
+    TaskUpdated(ServiceTaskRecord),
     #[allow(dead_code)]
     TerminalOutput(TerminalOutput),
     #[allow(dead_code)]
@@ -144,6 +147,7 @@ impl EventSink for DaemonEventSink {
 
 struct DaemonConfig {
     listen: SocketAddr,
+    http_listen: Option<SocketAddr>,
     token: Option<String>,
     data_dir: PathBuf,
 }
@@ -152,6 +156,8 @@ struct DaemonState {
     data_dir: PathBuf,
     workspaces: Mutex<HashMap<String, WorkspaceEntry>>,
     sessions: Mutex<HashMap<String, Arc<WorkspaceSession>>>,
+    tasks: Mutex<HashMap<String, ServiceTaskRecord>>,
+    tasks_path: PathBuf,
     storage_path: PathBuf,
     settings_path: PathBuf,
     app_settings: Mutex<AppSettings>,
@@ -166,12 +172,28 @@ struct WorkspaceFileResponse {
     truncated: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceTaskRecord {
+    task_id: String,
+    status: String,
+    workspace_id: String,
+    thread_id: String,
+    turn_id: Option<String>,
+    created_thread: bool,
+    submitted_at_ms: u64,
+    completed_at_ms: Option<u64>,
+    last_error: Option<String>,
+}
+
 impl DaemonState {
     fn load(config: &DaemonConfig, event_sink: DaemonEventSink) -> Self {
         let storage_path = config.data_dir.join("workspaces.json");
         let settings_path = config.data_dir.join("settings.json");
+        let tasks_path = config.data_dir.join("service_tasks.json");
         let workspaces = read_workspaces(&storage_path).unwrap_or_default();
         let app_settings = read_settings(&settings_path).unwrap_or_default();
+        let tasks = load_service_tasks(&tasks_path);
         let daemon_binary_path = std::env::current_exe()
             .ok()
             .and_then(|path| path.to_str().map(str::to_string));
@@ -179,6 +201,8 @@ impl DaemonState {
             data_dir: config.data_dir.clone(),
             workspaces: Mutex::new(workspaces),
             sessions: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(tasks),
+            tasks_path,
             storage_path,
             settings_path,
             app_settings: Mutex::new(app_settings),
@@ -196,6 +220,127 @@ impl DaemonState {
             "mode": "tcp",
             "binaryPath": self.daemon_binary_path,
         })
+    }
+
+    async fn insert_task(&self, task: ServiceTaskRecord) -> ServiceTaskRecord {
+        {
+            let mut tasks = self.tasks.lock().await;
+            tasks.insert(task.task_id.clone(), task.clone());
+            self.persist_tasks_locked(&tasks);
+        }
+        let _ = self.event_sink.tx.send(DaemonEvent::TaskUpdated(task.clone()));
+        task
+    }
+
+    async fn get_task(&self, task_id: &str) -> Option<ServiceTaskRecord> {
+        self.tasks.lock().await.get(task_id).cloned()
+    }
+
+    async fn update_task<F>(&self, task_id: &str, update: F) -> Option<ServiceTaskRecord>
+    where
+        F: FnOnce(&mut ServiceTaskRecord),
+    {
+        let updated = {
+            let mut tasks = self.tasks.lock().await;
+            let task = tasks.get_mut(task_id)?;
+            update(task);
+            let updated = task.clone();
+            self.persist_tasks_locked(&tasks);
+            updated
+        };
+        let _ = self
+            .event_sink
+            .tx
+            .send(DaemonEvent::TaskUpdated(updated.clone()));
+        Some(updated)
+    }
+
+    fn persist_tasks_locked(&self, tasks: &HashMap<String, ServiceTaskRecord>) {
+        if let Err(err) = write_service_tasks(&self.tasks_path, tasks) {
+            eprintln!(
+                "daemon: failed to persist tasks to {}: {err}",
+                self.tasks_path.display()
+            );
+        }
+    }
+
+    async fn mark_task_running(
+        &self,
+        task_id: &str,
+        turn_id: Option<String>,
+    ) -> Option<ServiceTaskRecord> {
+        self.update_task(task_id, move |task| {
+            if let Some(turn_id) = turn_id {
+                task.turn_id = Some(turn_id);
+            }
+            if task.status == "accepted" {
+                task.status = "running".to_string();
+            }
+        })
+        .await
+    }
+
+    async fn mark_task_completed(&self, task_id: &str) -> Option<ServiceTaskRecord> {
+        self.update_task(task_id, |task| {
+            if !is_terminal_task_status(&task.status) {
+                task.status = "completed".to_string();
+                task.completed_at_ms = Some(current_timestamp_ms());
+                task.last_error = None;
+            }
+        })
+        .await
+    }
+
+    async fn mark_task_failed(
+        &self,
+        task_id: &str,
+        error_message: Option<String>,
+    ) -> Option<ServiceTaskRecord> {
+        self.update_task(task_id, move |task| {
+            if !is_terminal_task_status(&task.status) {
+                task.status = "failed".to_string();
+                task.completed_at_ms = Some(current_timestamp_ms());
+            }
+            if let Some(message) = error_message {
+                task.last_error = Some(message);
+            }
+        })
+        .await
+    }
+
+    async fn process_task_event(&self, event: &AppServerEvent) {
+        let Some(method) = event.message.get("method").and_then(Value::as_str) else {
+            return;
+        };
+        let turn_id = extract_task_turn_id(&event.message);
+        let thread_id = extract_task_thread_id(&event.message);
+        let task_id = {
+            let tasks = self.tasks.lock().await;
+            find_matching_task_id(
+                &tasks,
+                &event.workspace_id,
+                thread_id.as_deref(),
+                turn_id.as_deref(),
+            )
+        };
+        let Some(task_id) = task_id else {
+            return;
+        };
+
+        match method {
+            "turn/started" => {
+                let _ = self.mark_task_running(&task_id, turn_id).await;
+            }
+            "turn/completed" => {
+                let _ = self.mark_task_completed(&task_id).await;
+            }
+            "error" | "turn/error" => {
+                let _ = self
+                    .mark_task_failed(&task_id, extract_task_error_message(&event.message))
+                    .await;
+            }
+            _ => {}
+        }
     }
 
     async fn sync_workspaces_from_storage(&self) {
@@ -1499,15 +1644,741 @@ fn default_data_dir() -> PathBuf {
 fn usage() -> String {
     format!(
         "\
-USAGE:\n  codex-monitor-daemon [--listen <addr>] [--data-dir <path>] [--token <token> | --insecure-no-auth]\n\n\
-OPTIONS:\n  --listen <addr>          Bind address (default: {DEFAULT_LISTEN_ADDR})\n  --data-dir <path>        Data dir holding workspaces.json/settings.json\n  --token <token>          Shared token required by TCP clients\n  --insecure-no-auth       Disable TCP auth (dev only)\n  -h, --help               Show this help\n"
+USAGE:\n  codex-monitor-daemon [--listen <addr>] [--http-listen <addr>] [--data-dir <path>] [--token <token> | --insecure-no-auth]\n\n\
+OPTIONS:\n  --listen <addr>          Bind address for TCP JSON-RPC (default: {DEFAULT_LISTEN_ADDR})\n  --http-listen <addr>     Optional bind address for thin HTTP bridge\n  --data-dir <path>        Data dir holding workspaces.json/settings.json\n  --token <token>          Shared token required by TCP and HTTP clients\n  --insecure-no-auth       Disable auth (dev only)\n  -h, --help               Show this help\n"
     )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HttpTaskSubmitRequest {
+    workspace_id: String,
+    text: String,
+    thread_id: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    service_tier: Option<Option<String>>,
+    access_mode: Option<String>,
+    images: Option<Vec<String>>,
+    app_mentions: Option<Vec<Value>>,
+    collaboration_mode: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HttpCreateTaskRequest {
+    workspace_id: String,
+    text: String,
+    thread_id: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    service_tier: Option<Option<String>>,
+    access_mode: Option<String>,
+    images: Option<Vec<String>>,
+    app_mentions: Option<Vec<Value>>,
+    collaboration_mode: Option<Value>,
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn load_service_tasks(path: &PathBuf) -> HashMap<String, ServiceTaskRecord> {
+    if !path.exists() {
+        return HashMap::new();
+    }
+
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("daemon: failed to read tasks from {}: {err}", path.display());
+            return HashMap::new();
+        }
+    };
+
+    let records: Vec<ServiceTaskRecord> = match serde_json::from_str(&data) {
+        Ok(records) => records,
+        Err(err) => {
+            eprintln!(
+                "daemon: failed to deserialize tasks from {}: {err}",
+                path.display()
+            );
+            return HashMap::new();
+        }
+    };
+
+    records
+        .into_iter()
+        .map(normalize_loaded_service_task)
+        .map(|record| (record.task_id.clone(), record))
+        .collect()
+}
+
+fn write_service_tasks(
+    path: &PathBuf,
+    tasks: &HashMap<String, ServiceTaskRecord>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+
+    let mut records = tasks.values().cloned().collect::<Vec<_>>();
+    records.sort_by(|a, b| {
+        a.submitted_at_ms
+            .cmp(&b.submitted_at_ms)
+            .then_with(|| a.task_id.cmp(&b.task_id))
+    });
+    let data = serde_json::to_string_pretty(&records).map_err(|err| err.to_string())?;
+    std::fs::write(path, data).map_err(|err| err.to_string())
+}
+
+fn normalize_loaded_service_task(mut task: ServiceTaskRecord) -> ServiceTaskRecord {
+    if matches!(task.status.as_str(), "accepted" | "running") {
+        task.status = "failed".to_string();
+        if task.completed_at_ms.is_none() {
+            task.completed_at_ms = Some(current_timestamp_ms());
+        }
+        if task.last_error.is_none() {
+            task.last_error = Some("daemon restarted before task completion".to_string());
+        }
+    }
+    task
+}
+
+fn is_terminal_task_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed")
+}
+
+fn extract_task_thread_id(message: &Value) -> Option<String> {
+    message
+        .get("params")
+        .and_then(|params| params.get("threadId"))
+        .or_else(|| {
+            message
+                .get("params")
+                .and_then(|params| params.get("thread"))
+                .and_then(|thread| thread.get("id"))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn extract_task_turn_id(message: &Value) -> Option<String> {
+    message
+        .get("params")
+        .and_then(|params| params.get("turnId"))
+        .or_else(|| {
+            message
+                .get("params")
+                .and_then(|params| params.get("turn"))
+                .and_then(|turn| turn.get("id"))
+        })
+        .or_else(|| message.get("result").and_then(|result| result.get("id")))
+        .or_else(|| {
+            message
+                .get("result")
+                .and_then(|result| result.get("turn"))
+                .and_then(|turn| turn.get("id"))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn extract_task_error_message(message: &Value) -> Option<String> {
+    let params = message.get("params")?;
+    params
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            params
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn find_matching_task_id(
+    tasks: &HashMap<String, ServiceTaskRecord>,
+    workspace_id: &str,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> Option<String> {
+    if let Some(turn_id) = turn_id {
+        if let Some(task) = tasks
+            .values()
+            .filter(|task| {
+                task.workspace_id == workspace_id && task.turn_id.as_deref() == Some(turn_id)
+            })
+            .max_by_key(|task| task.submitted_at_ms)
+        {
+            return Some(task.task_id.clone());
+        }
+    }
+
+    let thread_id = thread_id?;
+    tasks
+        .values()
+        .filter(|task| {
+            task.workspace_id == workspace_id
+                && task.thread_id == thread_id
+                && !is_terminal_task_status(&task.status)
+        })
+        .max_by_key(|task| task.submitted_at_ms)
+        .map(|task| task.task_id.clone())
+}
+
+fn app_server_event_matches_thread_stream(
+    event: &AppServerEvent,
+    workspace_id: &str,
+    thread_id: Option<&str>,
+) -> bool {
+    if event.workspace_id != workspace_id {
+        return false;
+    }
+
+    match thread_id {
+        Some(thread_id) => extract_task_thread_id(&event.message).as_deref() == Some(thread_id),
+        None => true,
+    }
+}
+
+fn http_json_response(status: &str, body: Value) -> String {
+    let body_string = serde_json::to_string(&body)
+        .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".to_string());
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body_string.len(),
+        body_string
+    )
+}
+
+fn http_error_response(status: &str, message: &str) -> String {
+    http_json_response(status, json!({ "error": message }))
+}
+
+fn parse_http_query(query: Option<&str>) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    let Some(query) = query else {
+        return result;
+    };
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let mut parts = pair.splitn(2, '=');
+        let raw_key = parts.next().unwrap_or_default();
+        let raw_value = parts.next().unwrap_or_default();
+        let key = match urlencoding::decode(raw_key) {
+            Ok(value) => value.into_owned(),
+            Err(_) => continue,
+        };
+        let value = match urlencoding::decode(raw_value) {
+            Ok(value) => value.into_owned(),
+            Err(_) => continue,
+        };
+        result.insert(key, value);
+    }
+
+    result
+}
+
+fn extract_http_token(headers: &HashMap<String, String>) -> Option<String> {
+    if let Some(value) = headers.get("x-codex-token") {
+        return Some(value.trim().to_string());
+    }
+
+    let auth = headers.get("authorization")?;
+    let (scheme, token) = auth.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn is_http_authorized(config: &DaemonConfig, headers: &HashMap<String, String>) -> bool {
+    match &config.token {
+        Some(expected) => extract_http_token(headers).as_deref() == Some(expected.as_str()),
+        None => true,
+    }
+}
+
+async fn read_http_request(
+    socket: &mut TcpStream,
+) -> Result<(String, String, Option<String>, HashMap<String, String>, Vec<u8>), String> {
+    let mut buffer = Vec::new();
+    let mut temp = [0_u8; 4096];
+    let header_end;
+
+    loop {
+        let bytes_read = socket
+            .read(&mut temp)
+            .await
+            .map_err(|err| format!("failed to read socket: {err}"))?;
+        if bytes_read == 0 {
+            return Err("connection closed".to_string());
+        }
+        buffer.extend_from_slice(&temp[..bytes_read]);
+        if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            header_end = index + 4;
+            break;
+        }
+        if buffer.len() > MAX_HTTP_BODY_BYTES {
+            return Err("request too large".to_string());
+        }
+    }
+
+    let header_text = std::str::from_utf8(&buffer[..header_end])
+        .map_err(|_| "invalid HTTP header encoding".to_string())?;
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().ok_or_else(|| "missing request line".to_string())?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .ok_or_else(|| "missing HTTP method".to_string())?
+        .to_string();
+    let target = request_parts
+        .next()
+        .ok_or_else(|| "missing request target".to_string())?;
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path.to_string(), Some(query.to_string())),
+        None => (target.to_string(), None),
+    };
+
+    let mut headers = HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return Err("request body too large".to_string());
+    }
+
+    let mut body = buffer[header_end..].to_vec();
+    while body.len() < content_length {
+        let bytes_read = socket
+            .read(&mut temp)
+            .await
+            .map_err(|err| format!("failed to read request body: {err}"))?;
+        if bytes_read == 0 {
+            return Err("connection closed before request body completed".to_string());
+        }
+        body.extend_from_slice(&temp[..bytes_read]);
+    }
+
+    Ok((method, path, query, headers, body))
+}
+
+async fn handle_http_task_submit(
+    state: &DaemonState,
+    request: HttpTaskSubmitRequest,
+) -> Result<Value, String> {
+    let thread_id = if let Some(thread_id) = request.thread_id.clone() {
+        thread_id
+    } else {
+        let created = state.start_thread(request.workspace_id.clone()).await?;
+        created
+            .get("threadId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "start_thread response missing `threadId`".to_string())?
+    };
+
+    let created_thread = request.thread_id.is_none();
+    let turn_response = state
+        .send_user_message(
+            request.workspace_id.clone(),
+            thread_id.clone(),
+            request.text,
+            request.model,
+            request.effort,
+            request.service_tier,
+            request.access_mode,
+            request.images,
+            request.app_mentions,
+            request.collaboration_mode,
+        )
+        .await?;
+    let turn_id = extract_task_turn_id(&turn_response);
+
+    Ok(json!({
+        "accepted": true,
+        "workspaceId": request.workspace_id,
+        "threadId": thread_id,
+        "createdThread": created_thread,
+        "turnId": turn_id
+    }))
+}
+
+async fn handle_http_create_task(
+    state: &DaemonState,
+    request: HttpCreateTaskRequest,
+) -> Result<Value, String> {
+    let response = handle_http_task_submit(
+        state,
+        HttpTaskSubmitRequest {
+            workspace_id: request.workspace_id,
+            text: request.text,
+            thread_id: request.thread_id,
+            model: request.model,
+            effort: request.effort,
+            service_tier: request.service_tier,
+            access_mode: request.access_mode,
+            images: request.images,
+            app_mentions: request.app_mentions,
+            collaboration_mode: request.collaboration_mode,
+        },
+    )
+    .await?;
+
+    let workspace_id = response
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "task submission response missing `workspaceId`".to_string())?;
+    let thread_id = response
+        .get("threadId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "task submission response missing `threadId`".to_string())?;
+    let created_thread = response
+        .get("createdThread")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let turn_id = response
+        .get("turnId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let task = state
+        .insert_task(ServiceTaskRecord {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            status: "accepted".to_string(),
+            workspace_id,
+            thread_id,
+            turn_id: turn_id.clone(),
+            created_thread,
+            submitted_at_ms: current_timestamp_ms(),
+            completed_at_ms: None,
+            last_error: None,
+        })
+        .await;
+    let _ = state.mark_task_running(&task.task_id, turn_id).await;
+
+    Ok(json!({
+        "task": task
+    }))
+}
+
+async fn write_sse_event(
+    socket: &mut TcpStream,
+    event_name: &str,
+    payload: &Value,
+) -> Result<(), String> {
+    let body = format!(
+        "event: {event_name}\ndata: {}\n\n",
+        serde_json::to_string(payload).map_err(|err| err.to_string())?
+    );
+    socket
+        .write_all(body.as_bytes())
+        .await
+        .map_err(|err| format!("failed to write SSE event: {err}"))
+}
+
+async fn handle_http_task_events_stream(
+    state: Arc<DaemonState>,
+    mut socket: TcpStream,
+    task_id: String,
+) {
+    let Some(task) = state.get_task(&task_id).await else {
+        let response = http_error_response("404 Not Found", "task not found");
+        let _ = socket.write_all(response.as_bytes()).await;
+        return;
+    };
+
+    let headers = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Type: text/event-stream\r\n",
+        "Cache-Control: no-cache\r\n",
+        "Connection: keep-alive\r\n",
+        "\r\n"
+    );
+    if socket.write_all(headers.as_bytes()).await.is_err() {
+        return;
+    }
+
+    if write_sse_event(&mut socket, "task", &json!({ "task": task.clone() }))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let mut rx = state.event_sink.tx.subscribe();
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
+        match next {
+            Ok(Ok(DaemonEvent::TaskUpdated(updated))) if updated.task_id == task_id => {
+                if write_sse_event(&mut socket, "task", &json!({ "task": updated.clone() }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if is_terminal_task_status(&updated.status) {
+                    break;
+                }
+            }
+            Ok(Ok(DaemonEvent::AppServer(event)))
+                if event.workspace_id == task.workspace_id
+                    && extract_task_thread_id(&event.message).as_deref()
+                        == Some(task.thread_id.as_str()) =>
+            {
+                if write_sse_event(&mut socket, "app-server-event", &json!(event))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            Err(_) => {
+                if socket.write_all(b": keep-alive\n\n").await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn handle_http_thread_events_stream(
+    state: Arc<DaemonState>,
+    mut socket: TcpStream,
+    workspace_id: String,
+    thread_id: Option<String>,
+) {
+    let headers = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Type: text/event-stream\r\n",
+        "Cache-Control: no-cache\r\n",
+        "Connection: keep-alive\r\n",
+        "\r\n"
+    );
+    if socket.write_all(headers.as_bytes()).await.is_err() {
+        return;
+    }
+
+    if write_sse_event(
+        &mut socket,
+        "stream",
+        &json!({
+            "workspaceId": workspace_id,
+            "threadId": thread_id,
+            "kind": "thread-events",
+        }),
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+
+    let mut rx = state.event_sink.tx.subscribe();
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
+        match next {
+            Ok(Ok(DaemonEvent::AppServer(event)))
+                if app_server_event_matches_thread_stream(
+                    &event,
+                    &workspace_id,
+                    thread_id.as_deref(),
+                ) =>
+            {
+                if write_sse_event(&mut socket, "app-server-event", &json!(event))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            Err(_) => {
+                if socket.write_all(b": keep-alive\n\n").await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn handle_http_request(
+    state: Arc<DaemonState>,
+    config: Arc<DaemonConfig>,
+    mut socket: TcpStream,
+) {
+    let response = match read_http_request(&mut socket).await {
+        Ok((method, path, query, headers, body)) => {
+            if !is_http_authorized(&config, &headers) {
+                http_error_response("401 Unauthorized", "unauthorized")
+            } else if method == "GET" && path == "/api/v1/events/threads" {
+                let query_map = parse_http_query(query.as_deref());
+                let Some(workspace_id) = query_map.get("workspaceId").cloned() else {
+                    let response =
+                        http_error_response("400 Bad Request", "missing `workspaceId`");
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                };
+                let thread_id = query_map
+                    .get("threadId")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                handle_http_thread_events_stream(state, socket, workspace_id, thread_id).await;
+                return;
+            } else if method == "GET"
+                && path.starts_with("/api/v1/tasks/")
+                && path.ends_with("/events")
+            {
+                let task_id = path
+                    .trim_start_matches("/api/v1/tasks/")
+                    .trim_end_matches("/events")
+                    .trim_end_matches('/')
+                    .to_string();
+                if task_id.is_empty() {
+                    http_error_response("400 Bad Request", "missing `taskId`")
+                } else {
+                    handle_http_task_events_stream(state, socket, task_id).await;
+                    return;
+                }
+            } else if method == "GET" && path == "/health" {
+                http_json_response(
+                    "200 OK",
+                    json!({
+                        "ok": true,
+                        "daemon": state.daemon_info(),
+                        "http": true
+                    }),
+                )
+            } else if method == "GET" && path == "/api/v1/health" {
+                http_json_response(
+                    "200 OK",
+                    json!({
+                        "ok": true,
+                        "daemon": state.daemon_info(),
+                        "http": true,
+                        "version": "v1"
+                    }),
+                )
+            } else if method == "GET" && path == "/api/workspaces" {
+                let workspaces = state.list_workspaces().await;
+                http_json_response("200 OK", json!({ "workspaces": workspaces }))
+            } else if method == "POST" && path == "/api/v1/tasks" {
+                match serde_json::from_slice::<HttpCreateTaskRequest>(&body) {
+                    Ok(request) => match handle_http_create_task(&state, request).await {
+                        Ok(result) => http_json_response("200 OK", result),
+                        Err(err) => http_error_response("400 Bad Request", &err),
+                    },
+                    Err(err) => http_error_response("400 Bad Request", &err.to_string()),
+                }
+            } else if method == "GET" && path.starts_with("/api/v1/tasks/") {
+                let task_id = path
+                    .trim_start_matches("/api/v1/tasks/")
+                    .trim()
+                    .to_string();
+                if task_id.is_empty() {
+                    http_error_response("400 Bad Request", "missing `taskId`")
+                } else {
+                    match state.get_task(&task_id).await {
+                        Some(task) => http_json_response("200 OK", json!({ "task": task })),
+                        None => http_error_response("404 Not Found", "task not found"),
+                    }
+                }
+            } else if method == "GET" && path == "/api/threads" {
+                let query_map = parse_http_query(query.as_deref());
+                match query_map.get("workspaceId") {
+                    Some(workspace_id) => match state
+                        .list_threads(workspace_id.to_string(), None, None, None)
+                        .await
+                    {
+                        Ok(result) => http_json_response("200 OK", result),
+                        Err(err) => http_error_response("400 Bad Request", &err),
+                    },
+                    None => http_error_response("400 Bad Request", "missing `workspaceId`"),
+                }
+            } else if method == "GET" && path == "/api/thread" {
+                let query_map = parse_http_query(query.as_deref());
+                match (query_map.get("workspaceId"), query_map.get("threadId")) {
+                    (Some(workspace_id), Some(thread_id)) => match state
+                        .read_thread(workspace_id.to_string(), thread_id.to_string())
+                        .await
+                    {
+                        Ok(result) => http_json_response("200 OK", result),
+                        Err(err) => http_error_response("400 Bad Request", &err),
+                    },
+                    _ => http_error_response(
+                        "400 Bad Request",
+                        "missing `workspaceId` or `threadId`",
+                    ),
+                }
+            } else if method == "POST" && path == "/api/task/submit" {
+                match serde_json::from_slice::<HttpTaskSubmitRequest>(&body) {
+                    Ok(request) => match handle_http_task_submit(&state, request).await {
+                        Ok(result) => http_json_response("200 OK", result),
+                        Err(err) => http_error_response("400 Bad Request", &err),
+                    },
+                    Err(err) => http_error_response("400 Bad Request", &err.to_string()),
+                }
+            } else {
+                http_error_response("404 Not Found", "not found")
+            }
+        }
+        Err(err) => http_error_response("400 Bad Request", &err),
+    };
+
+    let _ = socket.write_all(response.as_bytes()).await;
+}
+
+async fn forward_task_state_updates(
+    state: Arc<DaemonState>,
+    mut rx: broadcast::Receiver<DaemonEvent>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(DaemonEvent::AppServer(event)) => state.process_task_event(&event).await,
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 fn parse_args() -> Result<DaemonConfig, String> {
     let mut listen = DEFAULT_LISTEN_ADDR
         .parse::<SocketAddr>()
         .map_err(|err| err.to_string())?;
+    let mut http_listen: Option<SocketAddr> = None;
     let mut token = env::var("CODEX_MONITOR_DAEMON_TOKEN")
         .ok()
         .map(|value| value.trim().to_string())
@@ -1525,6 +2396,10 @@ fn parse_args() -> Result<DaemonConfig, String> {
             "--listen" => {
                 let value = args.next().ok_or("--listen requires a value")?;
                 listen = value.parse::<SocketAddr>().map_err(|err| err.to_string())?;
+            }
+            "--http-listen" => {
+                let value = args.next().ok_or("--http-listen requires a value")?;
+                http_listen = Some(value.parse::<SocketAddr>().map_err(|err| err.to_string())?);
             }
             "--token" => {
                 let value = args.next().ok_or("--token requires a value")?;
@@ -1559,6 +2434,7 @@ fn parse_args() -> Result<DaemonConfig, String> {
 
     Ok(DaemonConfig {
         listen,
+        http_listen,
         token,
         data_dir: data_dir.unwrap_or_else(default_data_dir),
     })
@@ -1578,6 +2454,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::process::Command;
+    use tokio::task::JoinHandle;
 
     fn run_async_test<F>(future: F)
     where
@@ -1609,6 +2486,8 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             workspaces: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(HashMap::new()),
+            tasks_path: data_dir.join("service_tasks.json"),
             storage_path: data_dir.join("workspaces.json"),
             settings_path: data_dir.join("settings.json"),
             app_settings: Mutex::new(AppSettings::default()),
@@ -1616,6 +2495,32 @@ mod tests {
             codex_login_cancels: Mutex::new(HashMap::new()),
             daemon_binary_path: Some("/tmp/codex-monitor-daemon".to_string()),
         }
+    }
+
+    async fn run_http_request(
+        state: Arc<DaemonState>,
+        config: Arc<DaemonConfig>,
+        request: &str,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server: JoinHandle<()> = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept test socket");
+            handle_http_request(state, config, socket).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect test listener");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        server.await.expect("join test server");
+        String::from_utf8(response).expect("utf8 response")
     }
 
     async fn insert_workspace(state: &DaemonState, workspace_id: &str, workspace_path: &str) {
@@ -1682,6 +2587,446 @@ mod tests {
             workspace_roots: Mutex::new(HashMap::new()),
             owner_workspace_id,
         })
+    }
+
+    #[test]
+    fn parse_http_query_decodes_expected_values() {
+        let parsed = parse_http_query(Some("workspaceId=abc&threadId=thread%201"));
+        assert_eq!(parsed.get("workspaceId").map(String::as_str), Some("abc"));
+        assert_eq!(parsed.get("threadId").map(String::as_str), Some("thread 1"));
+    }
+
+    #[test]
+    fn extract_http_token_supports_bearer_and_custom_header() {
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "Bearer secret".to_string());
+        assert_eq!(extract_http_token(&headers).as_deref(), Some("secret"));
+
+        headers.clear();
+        headers.insert("x-codex-token".to_string(), "other".to_string());
+        assert_eq!(extract_http_token(&headers).as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn http_health_requires_auth_when_token_is_configured() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-health-auth");
+            let state = Arc::new(test_state(&tmp));
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: Some("secret".to_string()),
+                data_dir: tmp.clone(),
+            });
+
+            let response = run_http_request(
+                state,
+                config,
+                "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await;
+
+            assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+            assert!(response.contains("\"error\":\"unauthorized\""));
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_health_returns_ok_with_valid_auth() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-health-ok");
+            let state = Arc::new(test_state(&tmp));
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: Some("secret".to_string()),
+                data_dir: tmp.clone(),
+            });
+
+            let response = run_http_request(
+                state,
+                config,
+                "GET /health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret\r\n\r\n",
+            )
+            .await;
+
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            assert!(response.contains("\"ok\":true"));
+            assert!(response.contains("\"http\":true"));
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_threads_requires_workspace_id_query() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-threads-query");
+            let state = Arc::new(test_state(&tmp));
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: None,
+                data_dir: tmp.clone(),
+            });
+
+            let response = run_http_request(
+                state,
+                config,
+                "GET /api/threads HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await;
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+            assert!(response.contains("missing `workspaceId`"));
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_task_submit_rejects_invalid_json() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-task-submit-json");
+            let state = Arc::new(test_state(&tmp));
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: None,
+                data_dir: tmp.clone(),
+            });
+
+            let request = concat!(
+                "POST /api/task/submit HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "Content-Type: application/json\r\n",
+                "Content-Length: 1\r\n",
+                "\r\n",
+                "{"
+            );
+            let response = run_http_request(state, config, request).await;
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+            assert!(response.contains("\"error\""));
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_task_submit_returns_workspace_not_connected_for_unconnected_workspace() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-task-submit-unconnected");
+            let state = Arc::new(test_state(&tmp));
+            insert_workspace(&state, "ws-http", &tmp.join("workspace").to_string_lossy()).await;
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: None,
+                data_dir: tmp.clone(),
+            });
+
+            let body =
+                r#"{"workspaceId":"ws-http","text":"run remote task","accessMode":"full-access"}"#;
+            let request = format!(
+                concat!(
+                    "POST /api/task/submit HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Content-Type: application/json\r\n",
+                    "Content-Length: {}\r\n",
+                    "\r\n",
+                    "{}"
+                ),
+                body.len(),
+                body
+            );
+            let response = run_http_request(state, config, &request).await;
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+            assert!(response.contains("workspace not connected"));
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_task_submit_accepts_connected_workspace_thread() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-task-submit-connected");
+            let state = Arc::new(test_state(&tmp));
+            insert_workspace(&state, "ws-http", &tmp.join("workspace").to_string_lossy()).await;
+            let session = make_session(make_workspace_entry(
+                "ws-http",
+                &tmp.join("workspace").to_string_lossy(),
+            ));
+            state
+                .sessions
+                .lock()
+                .await
+                .insert("ws-http".to_string(), Arc::clone(&session));
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: None,
+                data_dir: tmp.clone(),
+            });
+
+            let session_for_response = Arc::clone(&session);
+            let response_task = tokio::spawn(async move {
+                loop {
+                    if let Some(tx) = session_for_response.pending.lock().await.remove(&0) {
+                        tx.send(json!({ "result": { "id": "turn-1" } }))
+                            .expect("send mocked daemon response");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+
+            let body = r#"{"workspaceId":"ws-http","threadId":"thread-http","text":"run remote task","accessMode":"full-access"}"#;
+            let request = format!(
+                concat!(
+                    "POST /api/task/submit HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Content-Type: application/json\r\n",
+                    "Content-Length: {}\r\n",
+                    "\r\n",
+                    "{}"
+                ),
+                body.len(),
+                body
+            );
+            let response = run_http_request(Arc::clone(&state), config, &request).await;
+            response_task.await.expect("join mocked response task");
+
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            assert!(response.contains("\"accepted\":true"));
+            assert!(response.contains("\"workspaceId\":\"ws-http\""));
+            assert!(response.contains("\"threadId\":\"thread-http\""));
+            assert!(response.contains("\"createdThread\":false"));
+
+            if let Some(session) = state.sessions.lock().await.remove("ws-http") {
+                let mut child = session.child.lock().await;
+                kill_child_process_tree(&mut child).await;
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_v1_task_create_and_get_round_trip() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-v1-task-roundtrip");
+            let state = Arc::new(test_state(&tmp));
+            insert_workspace(&state, "ws-http", &tmp.join("workspace").to_string_lossy()).await;
+            let session = make_session(make_workspace_entry(
+                "ws-http",
+                &tmp.join("workspace").to_string_lossy(),
+            ));
+            state
+                .sessions
+                .lock()
+                .await
+                .insert("ws-http".to_string(), Arc::clone(&session));
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: None,
+                data_dir: tmp.clone(),
+            });
+
+            let session_for_response = Arc::clone(&session);
+            let response_task = tokio::spawn(async move {
+                loop {
+                    if let Some(tx) = session_for_response.pending.lock().await.remove(&0) {
+                        tx.send(json!({ "result": { "id": "turn-1" } }))
+                            .expect("send mocked daemon response");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+
+            let body = r#"{"workspaceId":"ws-http","threadId":"thread-http","text":"run remote task","accessMode":"full-access"}"#;
+            let request = format!(
+                concat!(
+                    "POST /api/v1/tasks HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Content-Type: application/json\r\n",
+                    "Content-Length: {}\r\n",
+                    "\r\n",
+                    "{}"
+                ),
+                body.len(),
+                body
+            );
+            let create_response = run_http_request(Arc::clone(&state), Arc::clone(&config), &request).await;
+            response_task.await.expect("join mocked response task");
+
+            assert!(create_response.starts_with("HTTP/1.1 200 OK"));
+            assert!(create_response.contains("\"status\":\"accepted\""));
+            assert!(create_response.contains("\"workspaceId\":\"ws-http\""));
+            assert!(create_response.contains("\"threadId\":\"thread-http\""));
+
+            let create_body = create_response
+                .split("\r\n\r\n")
+                .nth(1)
+                .expect("http body present");
+            let parsed: Value = serde_json::from_str(create_body).expect("valid json body");
+            let task_id = parsed
+                .get("task")
+                .and_then(|task| task.get("taskId"))
+                .and_then(Value::as_str)
+                .expect("task id")
+                .to_string();
+
+            let get_request = format!(
+                "GET /api/v1/tasks/{task_id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            let get_response = run_http_request(Arc::clone(&state), config, &get_request).await;
+            assert!(get_response.starts_with("HTTP/1.1 200 OK"));
+            assert!(get_response.contains(&format!("\"taskId\":\"{task_id}\"")));
+            assert!(get_response.contains("\"status\":\"running\""));
+            assert!(get_response.contains("\"turnId\":\"turn-1\""));
+
+            if let Some(session) = state.sessions.lock().await.remove("ws-http") {
+                let mut child = session.child.lock().await;
+                kill_child_process_tree(&mut child).await;
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn task_status_transitions_from_app_server_events() {
+        run_async_test(async {
+            let tmp = make_temp_dir("task-status-events");
+            let state = test_state(&tmp);
+            let task = state
+                .insert_task(ServiceTaskRecord {
+                    task_id: "task-1".to_string(),
+                    status: "accepted".to_string(),
+                    workspace_id: "ws-http".to_string(),
+                    thread_id: "thread-http".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    created_thread: false,
+                    submitted_at_ms: 1,
+                    completed_at_ms: None,
+                    last_error: None,
+                })
+                .await;
+
+            state
+                .process_task_event(&AppServerEvent {
+                    workspace_id: "ws-http".to_string(),
+                    message: json!({
+                        "method": "turn/started",
+                        "params": {
+                            "threadId": "thread-http",
+                            "turnId": "turn-1",
+                        }
+                    }),
+                })
+                .await;
+            let running = state.get_task(&task.task_id).await.expect("task present");
+            assert_eq!(running.status, "running");
+
+            state
+                .process_task_event(&AppServerEvent {
+                    workspace_id: "ws-http".to_string(),
+                    message: json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-http",
+                            "turnId": "turn-1",
+                        }
+                    }),
+                })
+                .await;
+            let completed = state.get_task(&task.task_id).await.expect("task present");
+            assert_eq!(completed.status, "completed");
+            assert!(completed.completed_at_ms.is_some());
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn app_server_event_thread_stream_filter_scopes_workspace_and_thread() {
+        let matching = AppServerEvent {
+            workspace_id: "ws-1".to_string(),
+            message: json!({
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread-1",
+                }
+            }),
+        };
+        let wrong_thread = AppServerEvent {
+            workspace_id: "ws-1".to_string(),
+            message: json!({
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread-2",
+                }
+            }),
+        };
+        let wrong_workspace = AppServerEvent {
+            workspace_id: "ws-2".to_string(),
+            message: json!({
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread-1",
+                }
+            }),
+        };
+
+        assert!(app_server_event_matches_thread_stream(
+            &matching,
+            "ws-1",
+            Some("thread-1"),
+        ));
+        assert!(!app_server_event_matches_thread_stream(
+            &wrong_thread,
+            "ws-1",
+            Some("thread-1"),
+        ));
+        assert!(!app_server_event_matches_thread_stream(
+            &wrong_workspace,
+            "ws-1",
+            Some("thread-1"),
+        ));
+        assert!(app_server_event_matches_thread_stream(&matching, "ws-1", None));
+    }
+
+    #[test]
+    fn service_tasks_round_trip_to_disk() {
+        let tmp = make_temp_dir("service-tasks-persist");
+        let path = tmp.join("service_tasks.json");
+        let mut tasks = HashMap::new();
+        tasks.insert(
+            "task-1".to_string(),
+            ServiceTaskRecord {
+                task_id: "task-1".to_string(),
+                status: "running".to_string(),
+                workspace_id: "ws-1".to_string(),
+                thread_id: "thread-1".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                created_thread: false,
+                submitted_at_ms: 10,
+                completed_at_ms: None,
+                last_error: None,
+            },
+        );
+
+        write_service_tasks(&path, &tasks).expect("persist tasks");
+        let loaded = load_service_tasks(&path);
+        let loaded_task = loaded.get("task-1").expect("task present");
+        assert_eq!(loaded_task.status, "failed");
+        assert_eq!(loaded_task.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(
+            loaded_task.last_error.as_deref(),
+            Some("daemon restarted before task completion")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1931,6 +3276,10 @@ fn main() {
         };
         let state = Arc::new(DaemonState::load(&config, event_sink));
         let config = Arc::new(config);
+        tokio::spawn(forward_task_state_updates(
+            Arc::clone(&state),
+            events_tx.subscribe(),
+        ));
 
         let listener = match TcpListener::bind(config.listen).await {
             Ok(listener) => listener,
@@ -1948,6 +3297,33 @@ fn main() {
                 .unwrap_or(&state.storage_path)
                 .display()
         );
+
+        if let Some(http_listen) = config.http_listen {
+            let http_state = Arc::clone(&state);
+            let http_config = Arc::clone(&config);
+            tokio::spawn(async move {
+                let listener = match TcpListener::bind(http_listen).await {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        eprintln!("failed to bind HTTP bridge {}: {err}", http_listen);
+                        std::process::exit(2);
+                    }
+                };
+                eprintln!("codex-monitor-daemon HTTP bridge listening on {}", http_listen);
+                loop {
+                    match listener.accept().await {
+                        Ok((socket, _addr)) => {
+                            let state = Arc::clone(&http_state);
+                            let config = Arc::clone(&http_config);
+                            tokio::spawn(async move {
+                                handle_http_request(state, config, socket).await;
+                            });
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            });
+        }
 
         loop {
             match listener.accept().await {

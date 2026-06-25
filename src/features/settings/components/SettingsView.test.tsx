@@ -186,6 +186,12 @@ const createUpdateResult = () => ({
   details: null,
 });
 
+const flushSettingsViewEffects = async () => {
+  await act(async () => {
+    await Promise.resolve();
+  });
+};
+
 const renderDisplaySection = (
   options: {
     appSettings?: Partial<AppSettings>;
@@ -427,7 +433,7 @@ const workspace = (
   },
 });
 
-const renderEnvironmentsSection = (
+const renderEnvironmentsSection = async (
   options: {
     appSettings?: Partial<AppSettings>;
     groupedWorkspaces?: ComponentProps<typeof SettingsView>["groupedWorkspaces"];
@@ -495,6 +501,7 @@ const renderEnvironmentsSection = (
   });
 
   const renderResult = render(<SettingsView {...buildProps()} />);
+  await flushSettingsViewEffects();
   return {
     onUpdateAppSettings,
     onUpdateWorkspaceSettings,
@@ -503,7 +510,11 @@ const renderEnvironmentsSection = (
         appSettings?: Partial<AppSettings>;
         groupedWorkspaces?: ComponentProps<typeof SettingsView>["groupedWorkspaces"];
       } = {},
-    ) => renderResult.rerender(<SettingsView {...buildProps(nextOptions)} />),
+    ) =>
+      act(async () => {
+        renderResult.rerender(<SettingsView {...buildProps(nextOptions)} />);
+        await Promise.resolve();
+      }),
   };
 };
 
@@ -774,8 +785,8 @@ describe("SettingsView About", () => {
 });
 
 describe("SettingsView Environments", () => {
-  it("shows the global worktrees root input", () => {
-    renderEnvironmentsSection({
+  it("shows the global worktrees root input", async () => {
+    await renderEnvironmentsSection({
       appSettings: { globalWorktreesFolder: "I:/existing-worktrees" },
     });
 
@@ -788,7 +799,7 @@ describe("SettingsView Environments", () => {
   it("saves the global worktrees root through app settings", async () => {
     const onUpdateAppSettings = vi.fn().mockResolvedValue(undefined);
     const onUpdateWorkspaceSettings = vi.fn().mockResolvedValue(undefined);
-    renderEnvironmentsSection({
+    await renderEnvironmentsSection({
       onUpdateAppSettings,
       onUpdateWorkspaceSettings,
     });
@@ -810,7 +821,7 @@ describe("SettingsView Environments", () => {
   it("does not clear an existing global worktrees root when saving project-only changes", async () => {
     const onUpdateAppSettings = vi.fn().mockResolvedValue(undefined);
     const onUpdateWorkspaceSettings = vi.fn().mockResolvedValue(undefined);
-    renderEnvironmentsSection({
+    await renderEnvironmentsSection({
       appSettings: { globalWorktreesFolder: "I:/existing-worktrees" },
       onUpdateAppSettings,
       onUpdateWorkspaceSettings,
@@ -835,7 +846,7 @@ describe("SettingsView Environments", () => {
       .fn()
       .mockRejectedValueOnce(new Error("Failed to save workspace settings"))
       .mockResolvedValueOnce(undefined);
-    renderEnvironmentsSection({
+    await renderEnvironmentsSection({
       appSettings: { globalWorktreesFolder: "I:/existing-worktrees" },
       onUpdateAppSettings,
       onUpdateWorkspaceSettings,
@@ -865,7 +876,7 @@ describe("SettingsView Environments", () => {
 
   it("keeps the global worktrees root editable when there are no projects", async () => {
     const onUpdateAppSettings = vi.fn().mockResolvedValue(undefined);
-    renderEnvironmentsSection({
+    await renderEnvironmentsSection({
       groupedWorkspaces: [],
       onUpdateAppSettings,
     });
@@ -890,7 +901,7 @@ describe("SettingsView Environments", () => {
       resolveSave = resolve;
     });
     const onUpdateAppSettings = vi.fn().mockImplementation(() => pendingSave);
-    renderEnvironmentsSection({
+    await renderEnvironmentsSection({
       groupedWorkspaces: [],
       onUpdateAppSettings,
     });
@@ -926,7 +937,7 @@ describe("SettingsView Environments", () => {
   });
 
   it("resyncs the global worktrees root baseline after dirty state clears", async () => {
-    const { rerender } = renderEnvironmentsSection({
+    const { rerender } = await renderEnvironmentsSection({
       groupedWorkspaces: [],
       appSettings: { globalWorktreesFolder: null },
     });
@@ -934,7 +945,7 @@ describe("SettingsView Environments", () => {
     const input = screen.getByLabelText("Global worktrees root");
     fireEvent.change(input, { target: { value: "I:/typing" } });
 
-    rerender({
+    await rerender({
       groupedWorkspaces: [],
       appSettings: { globalWorktreesFolder: "I:/loaded-from-settings" },
     });
@@ -956,7 +967,7 @@ describe("SettingsView Environments", () => {
     const onUpdateAppSettings = vi
       .fn()
       .mockRejectedValue(new Error("Failed to save global worktrees root"));
-    renderEnvironmentsSection({
+    await renderEnvironmentsSection({
       groupedWorkspaces: [],
       onUpdateAppSettings,
     });
@@ -975,7 +986,7 @@ describe("SettingsView Environments", () => {
     const onUpdateWorkspaceSettings = vi
       .fn()
       .mockRejectedValue(new Error("Failed to save workspace settings"));
-    renderEnvironmentsSection({
+    await renderEnvironmentsSection({
       appSettings: { globalWorktreesFolder: "I:/existing-worktrees" },
       onUpdateAppSettings,
       onUpdateWorkspaceSettings,
@@ -1016,7 +1027,7 @@ describe("SettingsView Environments", () => {
 
   it("saves the setup script for the selected project", async () => {
     const onUpdateWorkspaceSettings = vi.fn().mockResolvedValue(undefined);
-    renderEnvironmentsSection({ onUpdateWorkspaceSettings });
+    await renderEnvironmentsSection({ onUpdateWorkspaceSettings });
 
     expect(
       screen.getByText("Environments", { selector: ".settings-section-title" }),
@@ -1037,7 +1048,7 @@ describe("SettingsView Environments", () => {
 
   it("normalizes whitespace-only scripts to null", async () => {
     const onUpdateWorkspaceSettings = vi.fn().mockResolvedValue(undefined);
-    renderEnvironmentsSection({ onUpdateWorkspaceSettings });
+    await renderEnvironmentsSection({ onUpdateWorkspaceSettings });
 
     const textarea = screen.getByPlaceholderText("pnpm install");
     fireEvent.change(textarea, { target: { value: "   \n\t" } });
@@ -1060,7 +1071,7 @@ describe("SettingsView Environments", () => {
     });
 
     try {
-      renderEnvironmentsSection();
+      await renderEnvironmentsSection();
 
       fireEvent.click(screen.getByRole("button", { name: "Copy" }));
 

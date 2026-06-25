@@ -1,0 +1,27 @@
+[Unit]
+Description=Codex Monitor Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex
+Group=codex
+WorkingDirectory=/opt/codex-monitor-daemon
+EnvironmentFile=-/etc/codex-monitor-daemon/codex-monitor-daemon.env
+ExecStart=/opt/codex-monitor-daemon/bin/codex_monitor_daemon \
+  --listen ${CODEX_MONITOR_TCP_LISTEN:-127.0.0.1:4732} \
+  --http-listen ${CODEX_MONITOR_HTTP_LISTEN:-127.0.0.1:4733} \
+  --data-dir ${CODEX_MONITOR_DATA_DIR:-/var/lib/codex-monitor-daemon} \
+  --token ${CODEX_MONITOR_TOKEN}
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/codex-monitor-daemon
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

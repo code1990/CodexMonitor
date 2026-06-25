@@ -41,6 +41,7 @@ fn build_event_notification(event: DaemonEvent) -> Option<String> {
             "method": "app-server-event",
             "params": payload,
         }),
+        DaemonEvent::TaskUpdated(_) => return None,
         DaemonEvent::TerminalOutput(payload) => json!({
             "method": "terminal-output",
             "params": payload,
