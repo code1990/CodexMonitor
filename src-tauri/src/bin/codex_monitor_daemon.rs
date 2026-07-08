@@ -125,6 +125,7 @@ struct DaemonEventSink {
 enum DaemonEvent {
     AppServer(AppServerEvent),
     TaskUpdated(ServiceTaskRecord),
+    ConversationUpdated(ServiceConversationRecord),
     #[allow(dead_code)]
     TerminalOutput(TerminalOutput),
     #[allow(dead_code)]
@@ -157,10 +158,13 @@ struct DaemonState {
     workspaces: Mutex<HashMap<String, WorkspaceEntry>>,
     sessions: Mutex<HashMap<String, Arc<WorkspaceSession>>>,
     tasks: Mutex<HashMap<String, ServiceTaskRecord>>,
+    conversations: Mutex<HashMap<String, ServiceConversationRecord>>,
     tasks_path: PathBuf,
+    conversations_path: PathBuf,
     storage_path: PathBuf,
     settings_path: PathBuf,
     app_settings: Mutex<AppSettings>,
+    mysql_history: Option<MySqlHistoryWriter>,
     event_sink: DaemonEventSink,
     codex_login_cancels: Mutex<HashMap<String, CodexLoginCancelState>>,
     daemon_binary_path: Option<String>,
@@ -186,14 +190,262 @@ struct ServiceTaskRecord {
     last_error: Option<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceConversationRecord {
+    conversation_id: String,
+    workspace_id: String,
+    thread_id: String,
+    title: String,
+    requirement: String,
+    status: String,
+    operator: Option<String>,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+    last_message_preview: Option<String>,
+    final_summary: Option<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct MySqlHistoryWriter {
+    config: MySqlShellConfig,
+}
+
+#[derive(Clone)]
+struct MySqlShellConfig {
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    database: String,
+}
+
+impl MySqlHistoryWriter {
+    fn from_env() -> Option<Self> {
+        let database_url = env::var("CODEX_MONITOR_MYSQL_URL").ok()?;
+        let trimmed = database_url.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(Self {
+            config: parse_mysql_shell_config(trimmed).ok()?,
+        })
+    }
+
+    async fn upsert_conversation(
+        &self,
+        conversation: &ServiceConversationRecord,
+        requirement: &str,
+    ) -> Result<(), String> {
+        self.exec_sql(&format!(
+            "INSERT INTO conversation \
+            (conversation_id, workspace_id, thread_id, title, requirement, status, operator, last_message_preview, final_summary, last_error, created_at_ms, updated_at_ms) \
+            VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
+            ON DUPLICATE KEY UPDATE \
+              workspace_id = VALUES(workspace_id), \
+              thread_id = VALUES(thread_id), \
+              title = VALUES(title), \
+              requirement = VALUES(requirement), \
+              status = VALUES(status), \
+              operator = VALUES(operator), \
+              last_message_preview = VALUES(last_message_preview), \
+              final_summary = VALUES(final_summary), \
+              last_error = VALUES(last_error), \
+              updated_at_ms = VALUES(updated_at_ms)",
+            sql_string(&conversation.conversation_id),
+            sql_string(&conversation.workspace_id),
+            sql_string(&conversation.thread_id),
+            sql_string(&conversation.title),
+            sql_string(requirement),
+            sql_string(&conversation.status),
+            sql_option_string(conversation.operator.as_deref()),
+            sql_option_string(conversation.last_message_preview.as_deref()),
+            sql_option_string(conversation.final_summary.as_deref()),
+            sql_option_string(conversation.last_error.as_deref()),
+            sql_u64(conversation.created_at_ms),
+            sql_u64(conversation.updated_at_ms),
+        ))
+        .await
+    }
+
+    async fn upsert_task(
+        &self,
+        conversation_id: &str,
+        task: &ServiceTaskRecord,
+    ) -> Result<(), String> {
+        self.exec_sql(&format!(
+            "INSERT INTO conversation_task \
+            (conversation_id, task_id, workspace_id, thread_id, turn_id, status, created_thread, submitted_at_ms, completed_at_ms, last_error) \
+            VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
+            ON DUPLICATE KEY UPDATE \
+              conversation_id = VALUES(conversation_id), \
+              workspace_id = VALUES(workspace_id), \
+              thread_id = VALUES(thread_id), \
+              turn_id = VALUES(turn_id), \
+              status = VALUES(status), \
+              created_thread = VALUES(created_thread), \
+              submitted_at_ms = VALUES(submitted_at_ms), \
+              completed_at_ms = VALUES(completed_at_ms), \
+              last_error = VALUES(last_error)",
+            sql_string(conversation_id),
+            sql_string(&task.task_id),
+            sql_string(&task.workspace_id),
+            sql_string(&task.thread_id),
+            sql_option_string(task.turn_id.as_deref()),
+            sql_string(&task.status),
+            sql_string(if task.created_thread { "true" } else { "false" }),
+            sql_u64(task.submitted_at_ms),
+            sql_option_u64(task.completed_at_ms),
+            sql_option_string(task.last_error.as_deref()),
+        ))
+        .await
+    }
+
+    async fn insert_message(
+        &self,
+        conversation_id: &str,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        role: &str,
+        message_type: &str,
+        content: &str,
+        payload_json: Option<&str>,
+        created_at_ms: u64,
+    ) -> Result<(), String> {
+        self.exec_sql(&format!(
+            "INSERT INTO conversation_message \
+            (conversation_id, thread_id, turn_id, role, message_type, content, payload_json, sequence_no, created_at_ms) \
+            VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
+            sql_string(conversation_id),
+            sql_string(thread_id),
+            sql_option_string(turn_id),
+            sql_string(role),
+            sql_string(message_type),
+            sql_string(content),
+            sql_option_string(payload_json),
+            sql_u64(created_at_ms),
+            sql_u64(created_at_ms),
+        ))
+        .await
+    }
+
+    async fn insert_event(
+        &self,
+        conversation_id: &str,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        event_type: &str,
+        event_status: Option<&str>,
+        payload_json: &str,
+        created_at_ms: u64,
+    ) -> Result<(), String> {
+        self.exec_sql(&format!(
+            "INSERT INTO conversation_event \
+            (conversation_id, thread_id, turn_id, event_type, event_status, payload_json, created_at_ms) \
+            VALUES ({}, {}, {}, {}, {}, {}, {})",
+            sql_string(conversation_id),
+            sql_string(thread_id),
+            sql_option_string(turn_id),
+            sql_string(event_type),
+            sql_option_string(event_status),
+            sql_string(payload_json),
+            sql_u64(created_at_ms),
+        ))
+        .await
+    }
+
+    async fn exec_sql(&self, sql: &str) -> Result<(), String> {
+        let output = tokio::process::Command::new("mysql")
+            .arg(format!("-h{}", self.config.host))
+            .arg(format!("-P{}", self.config.port))
+            .arg(format!("-u{}", self.config.username))
+            .arg(&self.config.database)
+            .arg("-e")
+            .arg(sql)
+            .env("MYSQL_PWD", &self.config.password)
+            .output()
+            .await
+            .map_err(|err| err.to_string())?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn parse_mysql_shell_config(database_url: &str) -> Result<MySqlShellConfig, String> {
+    let trimmed = database_url.trim();
+    let without_scheme = trimmed
+        .strip_prefix("mysql://")
+        .ok_or_else(|| "mysql url must start with mysql://".to_string())?;
+    let (authority_and_db, _) = without_scheme
+        .split_once('?')
+        .unwrap_or((without_scheme, ""));
+    let (auth, database) = authority_and_db
+        .rsplit_once('@')
+        .ok_or_else(|| "mysql url missing @".to_string())?;
+    let (username, password) = auth
+        .split_once(':')
+        .ok_or_else(|| "mysql url missing password".to_string())?;
+    let (host_port, database) = database
+        .split_once('/')
+        .ok_or_else(|| "mysql url missing database".to_string())?;
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .ok_or_else(|| "mysql url missing port".to_string())?;
+    Ok(MySqlShellConfig {
+        host: host.to_string(),
+        port: port.parse().map_err(|_| "invalid mysql port".to_string())?,
+        username: username.to_string(),
+        password: password.to_string(),
+        database: database.to_string(),
+    })
+}
+
+fn sql_string(value: &str) -> String {
+    format!("'{}'", sql_escape(value))
+}
+
+fn sql_option_string(value: Option<&str>) -> String {
+    value.map(sql_string).unwrap_or_else(|| "NULL".to_string())
+}
+
+fn sql_u64(value: u64) -> String {
+    value.to_string()
+}
+
+fn sql_option_u64(value: Option<u64>) -> String {
+    value.map(sql_u64).unwrap_or_else(|| "NULL".to_string())
+}
+
+fn sql_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\0' => escaped.push_str("\\0"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\u{001A}' => escaped.push_str("\\Z"),
+            '\'' => escaped.push_str("\\'"),
+            '\\' => escaped.push_str("\\\\"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 impl DaemonState {
     fn load(config: &DaemonConfig, event_sink: DaemonEventSink) -> Self {
         let storage_path = config.data_dir.join("workspaces.json");
         let settings_path = config.data_dir.join("settings.json");
         let tasks_path = config.data_dir.join("service_tasks.json");
+        let conversations_path = config.data_dir.join("service_conversations.json");
         let workspaces = read_workspaces(&storage_path).unwrap_or_default();
         let app_settings = read_settings(&settings_path).unwrap_or_default();
         let tasks = load_service_tasks(&tasks_path);
+        let conversations = load_service_conversations(&conversations_path);
+        let mysql_history = MySqlHistoryWriter::from_env();
         let daemon_binary_path = std::env::current_exe()
             .ok()
             .and_then(|path| path.to_str().map(str::to_string));
@@ -202,10 +454,13 @@ impl DaemonState {
             workspaces: Mutex::new(workspaces),
             sessions: Mutex::new(HashMap::new()),
             tasks: Mutex::new(tasks),
+            conversations: Mutex::new(conversations),
             tasks_path,
+            conversations_path,
             storage_path,
             settings_path,
             app_settings: Mutex::new(app_settings),
+            mysql_history,
             event_sink,
             codex_login_cancels: Mutex::new(HashMap::new()),
             daemon_binary_path,
@@ -228,12 +483,80 @@ impl DaemonState {
             tasks.insert(task.task_id.clone(), task.clone());
             self.persist_tasks_locked(&tasks);
         }
+        self.persist_task_history(&task).await;
         let _ = self.event_sink.tx.send(DaemonEvent::TaskUpdated(task.clone()));
         task
     }
 
+    async fn insert_conversation(
+        &self,
+        conversation: ServiceConversationRecord,
+    ) -> ServiceConversationRecord {
+        {
+            let mut conversations = self.conversations.lock().await;
+            conversations.insert(
+                conversation.conversation_id.clone(),
+                conversation.clone(),
+            );
+            self.persist_conversations_locked(&conversations);
+        }
+        self.persist_conversation_history(&conversation).await;
+        let _ = self
+            .event_sink
+            .tx
+            .send(DaemonEvent::ConversationUpdated(conversation.clone()));
+        conversation
+    }
+
     async fn get_task(&self, task_id: &str) -> Option<ServiceTaskRecord> {
         self.tasks.lock().await.get(task_id).cloned()
+    }
+
+    async fn get_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Option<ServiceConversationRecord> {
+        self.conversations.lock().await.get(conversation_id).cloned()
+    }
+
+    async fn list_conversations(&self, workspace_id: Option<&str>) -> Vec<ServiceConversationRecord> {
+        let mut items = self
+            .conversations
+            .lock()
+            .await
+            .values()
+            .filter(|conversation| {
+                workspace_id
+                    .map(|workspace_id| conversation.workspace_id == workspace_id)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| a.conversation_id.cmp(&b.conversation_id))
+        });
+        items
+    }
+
+    async fn read_conversation_messages(&self, conversation_id: &str) -> Result<Value, String> {
+        let conversation = self
+            .get_conversation(conversation_id)
+            .await
+            .ok_or_else(|| "conversation not found".to_string())?;
+        let messages = self
+            .read_thread(
+                conversation.workspace_id.clone(),
+                conversation.thread_id.clone(),
+            )
+            .await?;
+        Ok(json!({
+            "conversationId": conversation_id,
+            "workspaceId": conversation.workspace_id,
+            "threadId": conversation.thread_id,
+            "messages": messages,
+        }))
     }
 
     async fn update_task<F>(&self, task_id: &str, update: F) -> Option<ServiceTaskRecord>
@@ -248,10 +571,36 @@ impl DaemonState {
             self.persist_tasks_locked(&tasks);
             updated
         };
+        self.persist_task_history(&updated).await;
         let _ = self
             .event_sink
             .tx
             .send(DaemonEvent::TaskUpdated(updated.clone()));
+        Some(updated)
+    }
+
+    async fn update_conversation<F>(
+        &self,
+        conversation_id: &str,
+        update: F,
+    ) -> Option<ServiceConversationRecord>
+    where
+        F: FnOnce(&mut ServiceConversationRecord),
+    {
+        let updated = {
+            let mut conversations = self.conversations.lock().await;
+            let conversation = conversations.get_mut(conversation_id)?;
+            update(conversation);
+            conversation.updated_at_ms = current_timestamp_ms();
+            let updated = conversation.clone();
+            self.persist_conversations_locked(&conversations);
+            updated
+        };
+        self.persist_conversation_history(&updated).await;
+        let _ = self
+            .event_sink
+            .tx
+            .send(DaemonEvent::ConversationUpdated(updated.clone()));
         Some(updated)
     }
 
@@ -262,6 +611,133 @@ impl DaemonState {
                 self.tasks_path.display()
             );
         }
+    }
+
+    fn persist_conversations_locked(
+        &self,
+        conversations: &HashMap<String, ServiceConversationRecord>,
+    ) {
+        if let Err(err) = write_service_conversations(&self.conversations_path, conversations) {
+            eprintln!(
+                "daemon: failed to persist conversations to {}: {err}",
+                self.conversations_path.display()
+            );
+        }
+    }
+
+    async fn persist_conversation_history(&self, conversation: &ServiceConversationRecord) {
+        let Some(writer) = self.mysql_history.clone() else {
+            return;
+        };
+        if let Err(err) = writer
+            .upsert_conversation(conversation, &conversation.requirement)
+            .await
+        {
+            eprintln!(
+                "daemon: failed to persist conversation {} to mysql: {err}",
+                conversation.conversation_id
+            );
+        }
+    }
+
+    async fn persist_task_history(&self, task: &ServiceTaskRecord) {
+        let Some(writer) = self.mysql_history.clone() else {
+            return;
+        };
+        let conversation_id = self
+            .resolve_conversation_id(&task.workspace_id, &task.thread_id)
+            .await;
+        let Some(conversation_id) = conversation_id else {
+            return;
+        };
+        if let Err(err) = writer.upsert_task(&conversation_id, task).await {
+            eprintln!(
+                "daemon: failed to persist task {} to mysql: {err}",
+                task.task_id
+            );
+        }
+    }
+
+    async fn persist_message_history(
+        &self,
+        conversation_id: &str,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        role: &str,
+        message_type: &str,
+        content: &str,
+        payload_json: Option<&str>,
+        created_at_ms: u64,
+    ) {
+        let Some(writer) = self.mysql_history.clone() else {
+            return;
+        };
+        if let Err(err) = writer
+            .insert_message(
+                conversation_id,
+                thread_id,
+                turn_id,
+                role,
+                message_type,
+                content,
+                payload_json,
+                created_at_ms,
+            )
+            .await
+        {
+            eprintln!(
+                "daemon: failed to persist conversation message {} to mysql: {err}",
+                conversation_id
+            );
+        }
+    }
+
+    async fn persist_event_history(
+        &self,
+        conversation_id: &str,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        event_type: &str,
+        event_status: Option<&str>,
+        payload_json: &str,
+        created_at_ms: u64,
+    ) {
+        let Some(writer) = self.mysql_history.clone() else {
+            return;
+        };
+        if let Err(err) = writer
+            .insert_event(
+                conversation_id,
+                thread_id,
+                turn_id,
+                event_type,
+                event_status,
+                payload_json,
+                created_at_ms,
+            )
+            .await
+        {
+            eprintln!(
+                "daemon: failed to persist conversation event {} to mysql: {err}",
+                conversation_id
+            );
+        }
+    }
+
+    async fn resolve_conversation_id(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> Option<String> {
+        self.conversations
+            .lock()
+            .await
+            .values()
+            .filter(|conversation| {
+                conversation.workspace_id == workspace_id && conversation.thread_id == thread_id
+            })
+            .max_by_key(|conversation| conversation.updated_at_ms)
+            .map(|conversation| conversation.conversation_id.clone())
     }
 
     async fn mark_task_running(
@@ -312,6 +788,7 @@ impl DaemonState {
         let Some(method) = event.message.get("method").and_then(Value::as_str) else {
             return;
         };
+        self.process_conversation_event(event).await;
         let turn_id = extract_task_turn_id(&event.message);
         let thread_id = extract_task_thread_id(&event.message);
         let task_id = {
@@ -340,6 +817,87 @@ impl DaemonState {
                     .await;
             }
             _ => {}
+        }
+    }
+
+    async fn process_conversation_event(&self, event: &AppServerEvent) {
+        let Some(method) = event.message.get("method").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(thread_id) = extract_task_thread_id(&event.message) else {
+            return;
+        };
+        let conversation_id = {
+            let conversations = self.conversations.lock().await;
+            conversations
+                .values()
+                .filter(|conversation| {
+                    conversation.workspace_id == event.workspace_id
+                        && conversation.thread_id == thread_id
+                })
+                .max_by_key(|conversation| conversation.updated_at_ms)
+                .map(|conversation| conversation.conversation_id.clone())
+        };
+        let Some(conversation_id) = conversation_id else {
+            return;
+        };
+
+        let next_status = map_conversation_status(method, &event.message);
+        let final_summary = extract_conversation_summary(&event.message);
+        let assistant_text = extract_assistant_message_text(&event.message);
+        let last_error = extract_task_error_message(&event.message);
+        let closure_next_status = next_status.clone();
+        let closure_final_summary = final_summary.clone();
+        let closure_assistant_text = assistant_text.clone();
+        let closure_last_error = last_error.clone();
+        let turn_id = extract_task_turn_id(&event.message);
+        let event_status = next_status.clone();
+        let event_payload_json = serde_json::to_string(&event.message).ok();
+        let event_created_at_ms = current_timestamp_ms();
+        let _ = self
+            .update_conversation(&conversation_id, move |conversation| {
+                if let Some(status) = closure_next_status.clone() {
+                    conversation.status = status;
+                }
+                if let Some(summary) = closure_final_summary.clone() {
+                    conversation.final_summary = Some(summary);
+                } else if let Some(text) = closure_assistant_text.clone() {
+                    conversation.final_summary = summary_text(&text);
+                }
+                if let Some(text) = closure_assistant_text.clone() {
+                    conversation.last_message_preview = preview_text(&text);
+                }
+                if let Some(error) = closure_last_error.clone() {
+                    conversation.last_error = Some(error);
+                } else if method == "turn/completed" {
+                    conversation.last_error = None;
+                }
+            })
+            .await;
+        if let Some(text) = assistant_text.as_deref() {
+            self.persist_message_history(
+                &conversation_id,
+                &thread_id,
+                turn_id.as_deref(),
+                "assistant",
+                method,
+                text,
+                event_payload_json.as_deref(),
+                event_created_at_ms,
+            )
+            .await;
+        }
+        if event_status.is_some() || final_summary.is_some() || last_error.is_some() || assistant_text.is_some() {
+            self.persist_event_history(
+                &conversation_id,
+                &thread_id,
+                turn_id.as_deref(),
+                method,
+                event_status.as_deref(),
+                event_payload_json.as_deref().unwrap_or("{}"),
+                event_created_at_ms,
+            )
+            .await;
         }
     }
 
@@ -1679,6 +2237,37 @@ struct HttpCreateTaskRequest {
     collaboration_mode: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HttpConversationStartRequest {
+    workspace_id: String,
+    title: String,
+    requirement: String,
+    operator: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    service_tier: Option<Option<String>>,
+    access_mode: Option<String>,
+    images: Option<Vec<String>>,
+    app_mentions: Option<Vec<Value>>,
+    collaboration_mode: Option<Value>,
+    codex_profile: Option<String>,
+    default_prompt_template: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HttpConversationMessageRequest {
+    text: String,
+    model: Option<String>,
+    effort: Option<String>,
+    service_tier: Option<Option<String>>,
+    access_mode: Option<String>,
+    images: Option<Vec<String>>,
+    app_mentions: Option<Vec<Value>>,
+    collaboration_mode: Option<Value>,
+}
+
 fn current_timestamp_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1717,6 +2306,39 @@ fn load_service_tasks(path: &PathBuf) -> HashMap<String, ServiceTaskRecord> {
         .collect()
 }
 
+fn load_service_conversations(path: &PathBuf) -> HashMap<String, ServiceConversationRecord> {
+    if !path.exists() {
+        return HashMap::new();
+    }
+
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "daemon: failed to read conversations from {}: {err}",
+                path.display()
+            );
+            return HashMap::new();
+        }
+    };
+
+    let records: Vec<ServiceConversationRecord> = match serde_json::from_str(&data) {
+        Ok(records) => records,
+        Err(err) => {
+            eprintln!(
+                "daemon: failed to deserialize conversations from {}: {err}",
+                path.display()
+            );
+            return HashMap::new();
+        }
+    };
+
+    records
+        .into_iter()
+        .map(|record| (record.conversation_id.clone(), record))
+        .collect()
+}
+
 fn write_service_tasks(
     path: &PathBuf,
     tasks: &HashMap<String, ServiceTaskRecord>,
@@ -1730,6 +2352,24 @@ fn write_service_tasks(
         a.submitted_at_ms
             .cmp(&b.submitted_at_ms)
             .then_with(|| a.task_id.cmp(&b.task_id))
+    });
+    let data = serde_json::to_string_pretty(&records).map_err(|err| err.to_string())?;
+    std::fs::write(path, data).map_err(|err| err.to_string())
+}
+
+fn write_service_conversations(
+    path: &PathBuf,
+    conversations: &HashMap<String, ServiceConversationRecord>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+
+    let mut records = conversations.values().cloned().collect::<Vec<_>>();
+    records.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| a.conversation_id.cmp(&b.conversation_id))
     });
     let data = serde_json::to_string_pretty(&records).map_err(|err| err.to_string())?;
     std::fs::write(path, data).map_err(|err| err.to_string())
@@ -1787,6 +2427,29 @@ fn extract_task_turn_id(message: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn extract_response_thread_id(value: &Value) -> Option<String> {
+    value
+        .get("threadId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value.get("result")
+                .and_then(|result| result.get("threadId"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value.get("result")
+                .and_then(|result| result.get("thread"))
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value.get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+}
+
 fn extract_task_error_message(message: &Value) -> Option<String> {
     let params = message.get("params")?;
     params
@@ -1800,6 +2463,118 @@ fn extract_task_error_message(message: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
+}
+
+fn map_conversation_status(method: &str, message: &Value) -> Option<String> {
+    match method {
+        "thread/started" => Some("thread_created".to_string()),
+        "turn/started" => Some("running".to_string()),
+        "turn/completed" => Some("completed".to_string()),
+        "error" | "turn/error" => Some("failed".to_string()),
+        _ if has_waiting_input_payload(message) => Some("waiting_input".to_string()),
+        _ if has_waiting_approval_payload(message) => Some("waiting_approval".to_string()),
+        _ if has_streaming_payload(message) => Some("streaming".to_string()),
+        _ => None,
+    }
+}
+
+fn has_streaming_payload(message: &Value) -> bool {
+    message
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|method| {
+            method.contains("delta")
+                || method.contains("stream")
+                || method.contains("message/updated")
+                || method.contains("turn/text")
+        })
+        .unwrap_or(false)
+}
+
+fn has_waiting_input_payload(message: &Value) -> bool {
+    message
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|method| method == "item/tool/requestUserInput")
+        .unwrap_or(false)
+}
+
+fn has_waiting_approval_payload(message: &Value) -> bool {
+    message
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|method| method.ends_with("requestApproval"))
+        .unwrap_or(false)
+}
+
+fn extract_conversation_summary(message: &Value) -> Option<String> {
+    message
+        .get("params")
+        .and_then(|params| params.get("summary"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            message
+                .get("result")
+                .and_then(|result| result.get("summary"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn extract_assistant_message_text(message: &Value) -> Option<String> {
+    let params = message.get("params")?;
+    let item = params.get("item")?;
+    if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
+        return None;
+    }
+    item.get("text").and_then(Value::as_str).map(str::to_string)
+}
+
+fn build_requirement_prompt(
+    title: &str,
+    requirement: &str,
+    codex_profile: Option<&str>,
+    default_prompt_template: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(template) = default_prompt_template.map(str::trim).filter(|value| !value.is_empty()) {
+        parts.push(template.to_string());
+    }
+    if let Some(profile) = codex_profile.map(str::trim).filter(|value| !value.is_empty()) {
+        parts.push(format!("Codex Profile:\n{profile}"));
+    }
+    parts.push(format!(
+        "需求标题：\n{title}\n\n需求描述：\n{requirement}\n\n要求：\n1. 先基于当前代码库理解现状\n2. 输出实现过程和最终结果\n3. 若需要补充信息，明确提出"
+    ));
+    parts.join("\n\n")
+}
+
+fn preview_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let preview = trimmed.chars().take(160).collect::<String>();
+    Some(preview)
+}
+
+fn summary_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let summary = trimmed.chars().take(800).collect::<String>();
+    Some(summary)
+}
+
+async fn ensure_workspace_connected_for_http(
+    state: &DaemonState,
+    workspace_id: &str,
+) -> Result<(), String> {
+    state
+        .connect_workspace(workspace_id.to_string(), "daemon-http".to_string())
+        .await
 }
 
 fn find_matching_task_id(
@@ -1996,10 +2771,7 @@ async fn handle_http_task_submit(
         thread_id
     } else {
         let created = state.start_thread(request.workspace_id.clone()).await?;
-        created
-            .get("threadId")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+        extract_response_thread_id(&created)
             .ok_or_else(|| "start_thread response missing `threadId`".to_string())?
     };
 
@@ -2086,6 +2858,211 @@ async fn handle_http_create_task(
 
     Ok(json!({
         "task": task
+    }))
+}
+
+async fn handle_http_conversation_start(
+    state: &DaemonState,
+    request: HttpConversationStartRequest,
+) -> Result<Value, String> {
+    let title = request.title.trim().to_string();
+    let requirement = request.requirement.trim().to_string();
+    if title.is_empty() {
+        return Err("missing `title`".to_string());
+    }
+    if requirement.is_empty() {
+        return Err("missing `requirement`".to_string());
+    }
+
+    ensure_workspace_connected_for_http(state, &request.workspace_id).await?;
+    let start_response = state.start_thread(request.workspace_id.clone()).await?;
+    let thread_id = extract_response_thread_id(&start_response)
+        .ok_or_else(|| "start_thread response missing `threadId`".to_string())?;
+
+    let prompt = build_requirement_prompt(
+        &title,
+        &requirement,
+        request.codex_profile.as_deref(),
+        request.default_prompt_template.as_deref(),
+    );
+    let turn_response = state
+        .send_user_message(
+            request.workspace_id.clone(),
+            thread_id.clone(),
+            prompt,
+            request.model,
+            request.effort,
+            request.service_tier,
+            request.access_mode,
+            request.images,
+            request.app_mentions,
+            request.collaboration_mode,
+        )
+        .await?;
+    let turn_id = extract_task_turn_id(&turn_response);
+    let now = current_timestamp_ms();
+    let conversation = state
+        .insert_conversation(ServiceConversationRecord {
+            conversation_id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: request.workspace_id.clone(),
+            thread_id: thread_id.clone(),
+            title,
+            requirement: requirement.clone(),
+            status: "accepted".to_string(),
+            operator: request.operator.filter(|value| !value.trim().is_empty()),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_preview: preview_text(&requirement),
+            final_summary: None,
+            last_error: None,
+        })
+        .await;
+    let task = state
+        .insert_task(ServiceTaskRecord {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            status: "accepted".to_string(),
+            workspace_id: request.workspace_id,
+            thread_id,
+            turn_id: turn_id.clone(),
+            created_thread: true,
+            submitted_at_ms: now,
+            completed_at_ms: None,
+            last_error: None,
+        })
+        .await;
+    let _ = state.mark_task_running(&task.task_id, turn_id).await;
+    let _ = state
+        .update_conversation(&conversation.conversation_id, |conversation| {
+            conversation.status = "thread_created".to_string();
+        })
+        .await;
+    let start_event_payload = serde_json::to_string(&json!({
+        "title": &conversation.title,
+        "requirement": &requirement,
+        "taskId": &task.task_id,
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+    state
+        .persist_message_history(
+            &conversation.conversation_id,
+            &conversation.thread_id,
+            task.turn_id.as_deref(),
+            "user",
+            "requirement",
+            &requirement,
+            None,
+            now,
+        )
+        .await;
+    state
+        .persist_event_history(
+            &conversation.conversation_id,
+            &conversation.thread_id,
+            task.turn_id.as_deref(),
+            "http/start",
+            Some("accepted"),
+            &start_event_payload,
+            now,
+        )
+        .await;
+
+    Ok(json!({
+        "conversationId": conversation.conversation_id,
+        "workspaceId": conversation.workspace_id,
+        "threadId": conversation.thread_id,
+        "taskId": task.task_id,
+        "status": "accepted",
+    }))
+}
+
+async fn handle_http_conversation_message(
+    state: &DaemonState,
+    conversation_id: &str,
+    request: HttpConversationMessageRequest,
+) -> Result<Value, String> {
+    let conversation = state
+        .get_conversation(conversation_id)
+        .await
+        .ok_or_else(|| "conversation not found".to_string())?;
+    let text = request.text.trim().to_string();
+    if text.is_empty() {
+        return Err("missing `text`".to_string());
+    }
+
+    ensure_workspace_connected_for_http(state, &conversation.workspace_id).await?;
+    let turn_response = state
+        .send_user_message(
+            conversation.workspace_id.clone(),
+            conversation.thread_id.clone(),
+            text.clone(),
+            request.model,
+            request.effort,
+            request.service_tier,
+            request.access_mode,
+            request.images,
+            request.app_mentions,
+            request.collaboration_mode,
+        )
+        .await?;
+    let turn_id = extract_task_turn_id(&turn_response);
+    let task = state
+        .insert_task(ServiceTaskRecord {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            status: "accepted".to_string(),
+            workspace_id: conversation.workspace_id.clone(),
+            thread_id: conversation.thread_id.clone(),
+            turn_id: turn_id.clone(),
+            created_thread: false,
+            submitted_at_ms: current_timestamp_ms(),
+            completed_at_ms: None,
+            last_error: None,
+        })
+        .await;
+    let _ = state.mark_task_running(&task.task_id, turn_id).await;
+    let preview = preview_text(&text);
+    let _ = state
+        .update_conversation(conversation_id, move |conversation| {
+            conversation.last_message_preview = preview.clone();
+            conversation.status = "accepted".to_string();
+            conversation.last_error = None;
+        })
+        .await;
+    let now = current_timestamp_ms();
+    let message_event_payload = serde_json::to_string(&json!({
+        "text": &text,
+        "taskId": &task.task_id,
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+    state
+        .persist_message_history(
+            conversation_id,
+            &conversation.thread_id,
+            task.turn_id.as_deref(),
+            "user",
+            "message",
+            &text,
+            None,
+            now,
+        )
+        .await;
+    state
+        .persist_event_history(
+            conversation_id,
+            &conversation.thread_id,
+            task.turn_id.as_deref(),
+            "http/message",
+            Some("accepted"),
+            &message_event_payload,
+            now,
+        )
+        .await;
+
+    Ok(json!({
+        "conversationId": conversation_id,
+        "workspaceId": conversation.workspace_id,
+        "threadId": conversation.thread_id,
+        "taskId": task.task_id,
+        "status": "accepted",
     }))
 }
 
@@ -2234,6 +3211,99 @@ async fn handle_http_thread_events_stream(
     }
 }
 
+async fn handle_http_conversation_events_stream(
+    state: Arc<DaemonState>,
+    mut socket: TcpStream,
+    conversation_id: String,
+) {
+    let Some(conversation) = state.get_conversation(&conversation_id).await else {
+        let response = http_error_response("404 Not Found", "conversation not found");
+        let _ = socket.write_all(response.as_bytes()).await;
+        return;
+    };
+
+    let headers = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Type: text/event-stream\r\n",
+        "Cache-Control: no-cache\r\n",
+        "Connection: keep-alive\r\n",
+        "\r\n"
+    );
+    if socket.write_all(headers.as_bytes()).await.is_err() {
+        return;
+    }
+
+    if write_sse_event(
+        &mut socket,
+        "conversation",
+        &json!({ "conversation": conversation.clone() }),
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+
+    let mut rx = state.event_sink.tx.subscribe();
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
+        match next {
+            Ok(Ok(DaemonEvent::ConversationUpdated(updated)))
+                if updated.conversation_id == conversation_id =>
+            {
+                if write_sse_event(&mut socket, "conversation", &json!({ "conversation": updated }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Ok(DaemonEvent::TaskUpdated(task)))
+                if task.workspace_id == conversation.workspace_id
+                    && task.thread_id == conversation.thread_id =>
+            {
+                if write_sse_event(&mut socket, "task", &json!({ "task": task }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Ok(DaemonEvent::AppServer(event)))
+                if event.workspace_id == conversation.workspace_id
+                    && extract_task_thread_id(&event.message).as_deref()
+                        == Some(conversation.thread_id.as_str()) =>
+            {
+                if write_sse_event(
+                    &mut socket,
+                    "lifecycle",
+                    &json!({
+                        "conversationId": conversation_id,
+                        "status": map_conversation_status(
+                            event.message.get("method").and_then(Value::as_str).unwrap_or_default(),
+                            &event.message,
+                        ),
+                        "event": event,
+                    }),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            Err(_) => {
+                if socket.write_all(b": keep-alive\n\n").await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 async fn handle_http_request(
     state: Arc<DaemonState>,
     config: Arc<DaemonConfig>,
@@ -2256,6 +3326,23 @@ async fn handle_http_request(
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty());
                 handle_http_thread_events_stream(state, socket, workspace_id, thread_id).await;
+                return;
+            } else if method == "GET"
+                && path.starts_with("/api/v1/conversations/")
+                && path.ends_with("/events")
+            {
+                let conversation_id = path
+                    .trim_start_matches("/api/v1/conversations/")
+                    .trim_end_matches("/events")
+                    .trim_end_matches('/')
+                    .to_string();
+                if conversation_id.is_empty() {
+                    let response =
+                        http_error_response("400 Bad Request", "missing `conversationId`");
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    return;
+                }
+                handle_http_conversation_events_stream(state, socket, conversation_id).await;
                 return;
             } else if method == "GET"
                 && path.starts_with("/api/v1/tasks/")
@@ -2313,6 +3400,81 @@ async fn handle_http_request(
                     match state.get_task(&task_id).await {
                         Some(task) => http_json_response("200 OK", json!({ "task": task })),
                         None => http_error_response("404 Not Found", "task not found"),
+                    }
+                }
+            } else if method == "POST" && path == "/api/v1/conversations/start" {
+                match serde_json::from_slice::<HttpConversationStartRequest>(&body) {
+                    Ok(request) => match handle_http_conversation_start(&state, request).await {
+                        Ok(result) => http_json_response("200 OK", result),
+                        Err(err) => http_error_response("400 Bad Request", &err),
+                    },
+                    Err(err) => http_error_response("400 Bad Request", &err.to_string()),
+                }
+            } else if method == "GET" && path == "/api/v1/conversations" {
+                let query_map = parse_http_query(query.as_deref());
+                let workspace_id = query_map.get("workspaceId").map(String::as_str);
+                let conversations = state.list_conversations(workspace_id).await;
+                http_json_response(
+                    "200 OK",
+                    json!({ "items": conversations, "conversations": conversations }),
+                )
+            } else if method == "POST"
+                && path.starts_with("/api/v1/conversations/")
+                && path.ends_with("/messages")
+            {
+                let conversation_id = path
+                    .trim_start_matches("/api/v1/conversations/")
+                    .trim_end_matches("/messages")
+                    .trim_end_matches('/')
+                    .to_string();
+                if conversation_id.is_empty() {
+                    http_error_response("400 Bad Request", "missing `conversationId`")
+                } else {
+                    match serde_json::from_slice::<HttpConversationMessageRequest>(&body) {
+                        Ok(request) => {
+                            match handle_http_conversation_message(&state, &conversation_id, request)
+                                .await
+                            {
+                                Ok(result) => http_json_response("200 OK", result),
+                                Err(err) if err == "conversation not found" => {
+                                    http_error_response("404 Not Found", &err)
+                                }
+                                Err(err) => http_error_response("400 Bad Request", &err),
+                            }
+                        }
+                        Err(err) => http_error_response("400 Bad Request", &err.to_string()),
+                    }
+                }
+            } else if method == "GET"
+                && path.starts_with("/api/v1/conversations/")
+                && path.ends_with("/messages")
+            {
+                let conversation_id = path
+                    .trim_start_matches("/api/v1/conversations/")
+                    .trim_end_matches("/messages")
+                    .trim_end_matches('/')
+                    .to_string();
+                if conversation_id.is_empty() {
+                    http_error_response("400 Bad Request", "missing `conversationId`")
+                } else {
+                    match state.read_conversation_messages(&conversation_id).await {
+                        Ok(result) => http_json_response("200 OK", result),
+                        Err(err) if err == "conversation not found" => {
+                            http_error_response("404 Not Found", &err)
+                        }
+                        Err(err) => http_error_response("400 Bad Request", &err),
+                    }
+                }
+            } else if method == "GET" && path.starts_with("/api/v1/conversations/") {
+                let trimmed = path.trim_start_matches("/api/v1/conversations/").trim_matches('/');
+                if trimmed.is_empty() || trimmed.contains('/') {
+                    http_error_response("404 Not Found", "not found")
+                } else {
+                    match state.get_conversation(trimmed).await {
+                        Some(conversation) => {
+                            http_json_response("200 OK", json!({ "conversation": conversation }))
+                        }
+                        None => http_error_response("404 Not Found", "conversation not found"),
                     }
                 }
             } else if method == "GET" && path == "/api/threads" {
@@ -2487,10 +3649,13 @@ mod tests {
             workspaces: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
+            conversations: Mutex::new(HashMap::new()),
             tasks_path: data_dir.join("service_tasks.json"),
+            conversations_path: data_dir.join("service_conversations.json"),
             storage_path: data_dir.join("workspaces.json"),
             settings_path: data_dir.join("settings.json"),
             app_settings: Mutex::new(AppSettings::default()),
+            mysql_history: None,
             event_sink: DaemonEventSink { tx },
             codex_login_cancels: Mutex::new(HashMap::new()),
             daemon_binary_path: Some("/tmp/codex-monitor-daemon".to_string()),
@@ -2605,6 +3770,162 @@ mod tests {
         headers.clear();
         headers.insert("x-codex-token".to_string(), "other".to_string());
         assert_eq!(extract_http_token(&headers).as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn mysql_shell_config_parses_basic_url() {
+        let config = parse_mysql_shell_config("mysql://root:123456@127.0.0.1:3306/ruoyi-fastapi")
+            .expect("mysql config");
+
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 3306);
+        assert_eq!(config.username, "root");
+        assert_eq!(config.password, "123456");
+        assert_eq!(config.database, "ruoyi-fastapi");
+    }
+
+    #[test]
+    fn sql_escape_handles_quotes_and_newlines() {
+        assert_eq!(sql_escape("a'b\\c\n"), "a\\'b\\\\c\\n");
+    }
+
+    #[test]
+    fn mysql_history_writer_persists_rows_when_local_mysql_is_available() {
+        run_async_test(async {
+            let writer = MySqlHistoryWriter {
+                config: MySqlShellConfig {
+                    host: "127.0.0.1".to_string(),
+                    port: 3306,
+                    username: "root".to_string(),
+                    password: "123456".to_string(),
+                    database: "ruoyi-fastapi".to_string(),
+                },
+            };
+            let ping = tokio::process::Command::new("mysql")
+                .arg("-h127.0.0.1")
+                .arg("-P3306")
+                .arg("-uroot")
+                .arg("ruoyi-fastapi")
+                .arg("-Nse")
+                .arg("SELECT 1")
+                .env("MYSQL_PWD", "123456")
+                .output()
+                .await
+                .ok();
+            if ping.as_ref().map(|output| !output.status.success()).unwrap_or(true) {
+                return;
+            }
+
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos();
+            let conversation_id = format!("it-conv-{suffix}");
+            let task_id = format!("it-task-{suffix}");
+            let thread_id = format!("it-thread-{suffix}");
+            let turn_id = format!("it-turn-{suffix}");
+            let conversation = ServiceConversationRecord {
+                conversation_id: conversation_id.clone(),
+                workspace_id: "ws-it".to_string(),
+                thread_id: thread_id.clone(),
+                title: "MySQL smoke".to_string(),
+                requirement: "verify dual write".to_string(),
+                status: "completed".to_string(),
+                operator: Some("tester".to_string()),
+                created_at_ms: 1001,
+                updated_at_ms: 1002,
+                last_message_preview: Some("assistant reply".to_string()),
+                final_summary: Some("done".to_string()),
+                last_error: None,
+            };
+            let task = ServiceTaskRecord {
+                task_id: task_id.clone(),
+                status: "completed".to_string(),
+                workspace_id: "ws-it".to_string(),
+                thread_id: thread_id.clone(),
+                turn_id: Some(turn_id.clone()),
+                created_thread: true,
+                submitted_at_ms: 1003,
+                completed_at_ms: Some(1004),
+                last_error: None,
+            };
+
+            writer
+                .upsert_conversation(&conversation, &conversation.requirement)
+                .await
+                .expect("persist conversation");
+            writer
+                .upsert_task(&conversation_id, &task)
+                .await
+                .expect("persist task");
+            writer
+                .insert_message(
+                    &conversation_id,
+                    &thread_id,
+                    Some(&turn_id),
+                    "user",
+                    "message",
+                    "hello mysql",
+                    Some("{\"ok\":true}"),
+                    1005,
+                )
+                .await
+                .expect("persist message");
+            writer
+                .insert_event(
+                    &conversation_id,
+                    &thread_id,
+                    Some(&turn_id),
+                    "http/message",
+                    Some("accepted"),
+                    "{\"ok\":true}",
+                    1006,
+                )
+                .await
+                .expect("persist event");
+
+            let verify_sql = format!(
+                "SELECT \
+                    (SELECT COUNT(*) FROM conversation WHERE conversation_id = '{}'),\
+                    (SELECT COUNT(*) FROM conversation_task WHERE task_id = '{}'),\
+                    (SELECT COUNT(*) FROM conversation_message WHERE conversation_id = '{}'),\
+                    (SELECT COUNT(*) FROM conversation_event WHERE conversation_id = '{}')",
+                conversation_id, task_id, conversation_id, conversation_id
+            );
+            let output = tokio::process::Command::new("mysql")
+                .arg("-h127.0.0.1")
+                .arg("-P3306")
+                .arg("-uroot")
+                .arg("ruoyi-fastapi")
+                .arg("-Nse")
+                .arg(&verify_sql)
+                .env("MYSQL_PWD", "123456")
+                .output()
+                .await
+                .expect("verify mysql rows");
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1\t1\t1\t1");
+
+            let cleanup_sql = format!(
+                "DELETE FROM conversation_message WHERE conversation_id = '{}';\
+                 DELETE FROM conversation_event WHERE conversation_id = '{}';\
+                 DELETE FROM conversation_task WHERE conversation_id = '{}';\
+                 DELETE FROM conversation WHERE conversation_id = '{}';",
+                conversation_id, conversation_id, conversation_id, conversation_id
+            );
+            let cleanup = tokio::process::Command::new("mysql")
+                .arg("-h127.0.0.1")
+                .arg("-P3306")
+                .arg("-uroot")
+                .arg("ruoyi-fastapi")
+                .arg("-e")
+                .arg(&cleanup_sql)
+                .env("MYSQL_PWD", "123456")
+                .output()
+                .await
+                .expect("cleanup mysql rows");
+            assert!(cleanup.status.success());
+        });
     }
 
     #[test]
@@ -2895,6 +4216,340 @@ mod tests {
     }
 
     #[test]
+    fn http_conversation_list_returns_items_and_conversations() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-conversation-list-shape");
+            let state = Arc::new(test_state(&tmp));
+            state
+                .insert_conversation(ServiceConversationRecord {
+                    conversation_id: "conv-1".to_string(),
+                    workspace_id: "ws-http".to_string(),
+                    thread_id: "thread-http".to_string(),
+                    title: "Title".to_string(),
+                    requirement: "Requirement".to_string(),
+                    status: "completed".to_string(),
+                    operator: Some("tester".to_string()),
+                    created_at_ms: 1,
+                    updated_at_ms: 2,
+                    last_message_preview: Some("preview".to_string()),
+                    final_summary: Some("summary".to_string()),
+                    last_error: None,
+                })
+                .await;
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: None,
+                data_dir: tmp.clone(),
+            });
+
+            let response = run_http_request(
+                state,
+                config,
+                "GET /api/v1/conversations HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await;
+
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            assert!(response.contains("\"items\":["));
+            assert!(response.contains("\"conversations\":["));
+            assert!(response.contains("\"conversationId\":\"conv-1\""));
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_conversation_start_creates_conversation_and_task() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-conversation-start");
+            let state = Arc::new(test_state(&tmp));
+            insert_workspace(&state, "ws-http", &tmp.join("workspace").to_string_lossy()).await;
+            let session = make_session(make_workspace_entry(
+                "ws-http",
+                &tmp.join("workspace").to_string_lossy(),
+            ));
+            state
+                .sessions
+                .lock()
+                .await
+                .insert("ws-http".to_string(), Arc::clone(&session));
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: None,
+                data_dir: tmp.clone(),
+            });
+
+            let session_for_response = Arc::clone(&session);
+            let response_task = tokio::spawn(async move {
+                loop {
+                    if let Some(tx) = session_for_response.pending.lock().await.remove(&0) {
+                        tx.send(json!({ "result": { "threadId": "thread-http" } }))
+                            .expect("send mocked start_thread response");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                loop {
+                    if let Some(tx) = session_for_response.pending.lock().await.remove(&1) {
+                        tx.send(json!({ "result": { "id": "turn-1" } }))
+                            .expect("send mocked send_user_message response");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+
+            let body = r#"{"workspaceId":"ws-http","title":"Need summary","requirement":"Read repo and summarize.","accessMode":"full-access"}"#;
+            let request = format!(
+                concat!(
+                    "POST /api/v1/conversations/start HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Content-Type: application/json\r\n",
+                    "Content-Length: {}\r\n",
+                    "\r\n",
+                    "{}"
+                ),
+                body.len(),
+                body
+            );
+            let response = run_http_request(Arc::clone(&state), Arc::clone(&config), &request).await;
+            response_task.await.expect("join mocked response task");
+
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            assert!(response.contains("\"workspaceId\":\"ws-http\""));
+            assert!(response.contains("\"threadId\":\"thread-http\""));
+            assert!(response.contains("\"status\":\"accepted\""));
+
+            let response_body = response
+                .split("\r\n\r\n")
+                .nth(1)
+                .expect("http body present");
+            let parsed: Value = serde_json::from_str(response_body).expect("valid json body");
+            let conversation_id = parsed
+                .get("conversationId")
+                .and_then(Value::as_str)
+                .expect("conversation id");
+            let task_id = parsed
+                .get("taskId")
+                .and_then(Value::as_str)
+                .expect("task id");
+
+            let conversation = state
+                .get_conversation(conversation_id)
+                .await
+                .expect("conversation persisted");
+            assert_eq!(conversation.title, "Need summary");
+            assert_eq!(conversation.requirement, "Read repo and summarize.");
+            assert_eq!(conversation.status, "thread_created");
+            assert_eq!(conversation.thread_id, "thread-http");
+
+            let task = state.get_task(task_id).await.expect("task persisted");
+            assert_eq!(task.workspace_id, "ws-http");
+            assert_eq!(task.thread_id, "thread-http");
+            assert_eq!(task.turn_id.as_deref(), Some("turn-1"));
+            assert_eq!(task.status, "running");
+            assert!(task.created_thread);
+
+            let detail_request = format!(
+                "GET /api/v1/conversations/{conversation_id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            let detail_response = run_http_request(Arc::clone(&state), config, &detail_request).await;
+            assert!(detail_response.starts_with("HTTP/1.1 200 OK"));
+            assert!(detail_response.contains(&format!("\"conversationId\":\"{conversation_id}\"")));
+            assert!(detail_response.contains("\"threadId\":\"thread-http\""));
+
+            if let Some(session) = state.sessions.lock().await.remove("ws-http") {
+                let mut child = session.child.lock().await;
+                kill_child_process_tree(&mut child).await;
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_conversation_message_creates_follow_up_task_and_updates_preview() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-conversation-message");
+            let state = Arc::new(test_state(&tmp));
+            insert_workspace(&state, "ws-http", &tmp.join("workspace").to_string_lossy()).await;
+            state
+                .insert_conversation(ServiceConversationRecord {
+                    conversation_id: "conv-1".to_string(),
+                    workspace_id: "ws-http".to_string(),
+                    thread_id: "thread-http".to_string(),
+                    title: "Title".to_string(),
+                    requirement: "Requirement".to_string(),
+                    status: "completed".to_string(),
+                    operator: Some("tester".to_string()),
+                    created_at_ms: 1,
+                    updated_at_ms: 2,
+                    last_message_preview: Some("preview".to_string()),
+                    final_summary: Some("summary".to_string()),
+                    last_error: Some("old error".to_string()),
+                })
+                .await;
+            let session = make_session(make_workspace_entry(
+                "ws-http",
+                &tmp.join("workspace").to_string_lossy(),
+            ));
+            state
+                .sessions
+                .lock()
+                .await
+                .insert("ws-http".to_string(), Arc::clone(&session));
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: None,
+                data_dir: tmp.clone(),
+            });
+
+            let session_for_response = Arc::clone(&session);
+            let response_task = tokio::spawn(async move {
+                loop {
+                    if let Some(tx) = session_for_response.pending.lock().await.remove(&0) {
+                        tx.send(json!({ "result": { "id": "turn-2" } }))
+                            .expect("send mocked follow-up response");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+
+            let body = r#"{"text":"Need a shorter answer.","accessMode":"full-access"}"#;
+            let request = format!(
+                concat!(
+                    "POST /api/v1/conversations/conv-1/messages HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Content-Type: application/json\r\n",
+                    "Content-Length: {}\r\n",
+                    "\r\n",
+                    "{}"
+                ),
+                body.len(),
+                body
+            );
+            let response = run_http_request(Arc::clone(&state), config, &request).await;
+            response_task.await.expect("join mocked response task");
+
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            assert!(response.contains("\"conversationId\":\"conv-1\""));
+            assert!(response.contains("\"threadId\":\"thread-http\""));
+            assert!(response.contains("\"status\":\"accepted\""));
+
+            let response_body = response
+                .split("\r\n\r\n")
+                .nth(1)
+                .expect("http body present");
+            let parsed: Value = serde_json::from_str(response_body).expect("valid json body");
+            let task_id = parsed
+                .get("taskId")
+                .and_then(Value::as_str)
+                .expect("task id");
+
+            let conversation = state
+                .get_conversation("conv-1")
+                .await
+                .expect("conversation persisted");
+            assert_eq!(
+                conversation.last_message_preview.as_deref(),
+                Some("Need a shorter answer.")
+            );
+            assert_eq!(conversation.status, "accepted");
+            assert_eq!(conversation.last_error, None);
+
+            let task = state.get_task(task_id).await.expect("task persisted");
+            assert_eq!(task.thread_id, "thread-http");
+            assert_eq!(task.turn_id.as_deref(), Some("turn-2"));
+            assert_eq!(task.status, "running");
+            assert!(!task.created_thread);
+
+            if let Some(session) = state.sessions.lock().await.remove("ws-http") {
+                let mut child = session.child.lock().await;
+                kill_child_process_tree(&mut child).await;
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_conversation_messages_reads_from_conversation_service() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-conversation-messages");
+            let state = Arc::new(test_state(&tmp));
+            insert_workspace(&state, "ws-http", &tmp.join("workspace").to_string_lossy()).await;
+            state
+                .insert_conversation(ServiceConversationRecord {
+                    conversation_id: "conv-1".to_string(),
+                    workspace_id: "ws-http".to_string(),
+                    thread_id: "thread-http".to_string(),
+                    title: "Title".to_string(),
+                    requirement: "Requirement".to_string(),
+                    status: "completed".to_string(),
+                    operator: Some("tester".to_string()),
+                    created_at_ms: 1,
+                    updated_at_ms: 2,
+                    last_message_preview: Some("preview".to_string()),
+                    final_summary: Some("summary".to_string()),
+                    last_error: None,
+                })
+                .await;
+            let session = make_session(make_workspace_entry(
+                "ws-http",
+                &tmp.join("workspace").to_string_lossy(),
+            ));
+            state
+                .sessions
+                .lock()
+                .await
+                .insert("ws-http".to_string(), Arc::clone(&session));
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: None,
+                data_dir: tmp.clone(),
+            });
+
+            let session_for_response = Arc::clone(&session);
+            let response_task = tokio::spawn(async move {
+                loop {
+                    if let Some(tx) = session_for_response.pending.lock().await.remove(&0) {
+                        tx.send(json!({
+                            "items": [
+                                { "id": "msg-1", "type": "user", "text": "hello" }
+                            ]
+                        }))
+                        .expect("send mocked daemon response");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+
+            let response = run_http_request(
+                Arc::clone(&state),
+                config,
+                "GET /api/v1/conversations/conv-1/messages HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await;
+            response_task.await.expect("join mocked response task");
+
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            assert!(response.contains("\"conversationId\":\"conv-1\""));
+            assert!(response.contains("\"workspaceId\":\"ws-http\""));
+            assert!(response.contains("\"threadId\":\"thread-http\""));
+            assert!(response.contains("\"messages\":{\"items\":[{\"id\":\"msg-1\""));
+
+            if let Some(session) = state.sessions.lock().await.remove("ws-http") {
+                let mut child = session.child.lock().await;
+                kill_child_process_tree(&mut child).await;
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
     fn task_status_transitions_from_app_server_events() {
         run_async_test(async {
             let tmp = make_temp_dir("task-status-events");
@@ -2997,6 +4652,94 @@ mod tests {
     }
 
     #[test]
+    fn conversation_status_maps_request_user_input_event() {
+        let status = map_conversation_status(
+            "item/tool/requestUserInput",
+            &json!({
+                "method": "item/tool/requestUserInput",
+                "id": 1,
+                "params": {
+                    "threadId": "thread-1",
+                }
+            }),
+        );
+
+        assert_eq!(status.as_deref(), Some("waiting_input"));
+    }
+
+    #[test]
+    fn conversation_status_maps_request_approval_event() {
+        let status = map_conversation_status(
+            "item/permissions/requestApproval",
+            &json!({
+                "method": "item/permissions/requestApproval",
+                "id": 1,
+                "params": {
+                    "threadId": "thread-1",
+                }
+            }),
+        );
+
+        assert_eq!(status.as_deref(), Some("waiting_approval"));
+    }
+
+    #[test]
+    fn conversation_event_updates_summary_from_completed_assistant_message() {
+        run_async_test(async {
+            let tmp = make_temp_dir("conversation-summary-from-assistant");
+            let state = test_state(&tmp);
+            state
+                .insert_conversation(ServiceConversationRecord {
+                    conversation_id: "conv-1".to_string(),
+                    workspace_id: "ws-http".to_string(),
+                    thread_id: "thread-http".to_string(),
+                    title: "Title".to_string(),
+                    requirement: "Requirement".to_string(),
+                    status: "running".to_string(),
+                    operator: Some("tester".to_string()),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    last_message_preview: None,
+                    final_summary: None,
+                    last_error: None,
+                })
+                .await;
+
+            state
+                .process_conversation_event(&AppServerEvent {
+                    workspace_id: "ws-http".to_string(),
+                    message: json!({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-http",
+                            "item": {
+                                "type": "agentMessage",
+                                "id": "item-1",
+                                "text": "assistant final output"
+                            }
+                        }
+                    }),
+                })
+                .await;
+
+            let conversation = state
+                .get_conversation("conv-1")
+                .await
+                .expect("conversation present");
+            assert_eq!(
+                conversation.last_message_preview.as_deref(),
+                Some("assistant final output")
+            );
+            assert_eq!(
+                conversation.final_summary.as_deref(),
+                Some("assistant final output")
+            );
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
     fn service_tasks_round_trip_to_disk() {
         let tmp = make_temp_dir("service-tasks-persist");
         let path = tmp.join("service_tasks.json");
@@ -3025,6 +4768,39 @@ mod tests {
             loaded_task.last_error.as_deref(),
             Some("daemon restarted before task completion")
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn service_conversations_round_trip_to_disk() {
+        let tmp = make_temp_dir("service-conversations-persist");
+        let path = tmp.join("service_conversations.json");
+        let mut conversations = HashMap::new();
+        conversations.insert(
+            "conv-1".to_string(),
+            ServiceConversationRecord {
+                conversation_id: "conv-1".to_string(),
+                workspace_id: "ws-1".to_string(),
+                thread_id: "thread-1".to_string(),
+                title: "Title".to_string(),
+                requirement: "Requirement".to_string(),
+                status: "completed".to_string(),
+                operator: Some("tester".to_string()),
+                created_at_ms: 10,
+                updated_at_ms: 20,
+                last_message_preview: Some("preview".to_string()),
+                final_summary: Some("summary".to_string()),
+                last_error: None,
+            },
+        );
+
+        write_service_conversations(&path, &conversations).expect("persist conversations");
+        let loaded = load_service_conversations(&path);
+        let loaded_conversation = loaded.get("conv-1").expect("conversation present");
+        assert_eq!(loaded_conversation.thread_id, "thread-1");
+        assert_eq!(loaded_conversation.status, "completed");
+        assert_eq!(loaded_conversation.final_summary.as_deref(), Some("summary"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -42,6 +42,7 @@ fn build_event_notification(event: DaemonEvent) -> Option<String> {
             "params": payload,
         }),
         DaemonEvent::TaskUpdated(_) => return None,
+        DaemonEvent::ConversationUpdated(_) => return None,
         DaemonEvent::TerminalOutput(payload) => json!({
             "method": "terminal-output",
             "params": payload,
