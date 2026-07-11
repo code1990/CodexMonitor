@@ -534,7 +534,7 @@ V1 可以允许 daemon 本地文件继续存在，但如果要支撑 Web 稳定�
 - `conversation_id`
 - `task_id`
 - `status`
-- `created_thread`
+- `created_thread` (`TINYINT(1)` / boolean 标记；1=本次任务新建 thread，0=复用已有 thread)
 - `submitted_at`
 - `completed_at`
 - `last_error`

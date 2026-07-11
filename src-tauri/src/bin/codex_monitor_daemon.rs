@@ -64,8 +64,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::hash::{Hash, Hasher};
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufRead, BufReader as StdBufReader, Read};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -78,6 +79,7 @@ use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 
 use backend::app_server::{spawn_workspace_session, WorkspaceSession};
 use backend::events::{AppServerEvent, EventSink, TerminalExit, TerminalOutput};
+use chrono::DateTime;
 use shared::codex_core::CodexLoginCancelState;
 use shared::process_core::kill_child_process_tree;
 use shared::prompts_core::{self, CustomPromptEntry};
@@ -161,10 +163,13 @@ struct DaemonState {
     conversations: Mutex<HashMap<String, ServiceConversationRecord>>,
     tasks_path: PathBuf,
     conversations_path: PathBuf,
+    mysql_retry_path: PathBuf,
     storage_path: PathBuf,
     settings_path: PathBuf,
     app_settings: Mutex<AppSettings>,
     mysql_history: Option<MySqlHistoryWriter>,
+    mysql_retry_queue: Mutex<HashMap<String, PendingMySqlWrite>>,
+    mysql_retry_flush_lock: Mutex<()>,
     event_sink: DaemonEventSink,
     codex_login_cancels: Mutex<HashMap<String, CodexLoginCancelState>>,
     daemon_binary_path: Option<String>,
@@ -207,6 +212,39 @@ struct ServiceConversationRecord {
     last_error: Option<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingMySqlWrite {
+    key: String,
+    kind: String,
+    sql: String,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+    attempt_count: u32,
+    last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryBackfillMessage {
+    turn_id: Option<String>,
+    role: String,
+    message_type: String,
+    content: String,
+    payload_json: Option<String>,
+    created_at_ms: u64,
+}
+
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryBackfillReport {
+    conversations_selected: usize,
+    conversations_upserted: usize,
+    tasks_upserted: usize,
+    messages_backfilled: usize,
+    conversations_failed: usize,
+    message_failures: usize,
+}
+
 #[derive(Clone)]
 struct MySqlHistoryWriter {
     config: MySqlShellConfig,
@@ -238,35 +276,8 @@ impl MySqlHistoryWriter {
         conversation: &ServiceConversationRecord,
         requirement: &str,
     ) -> Result<(), String> {
-        self.exec_sql(&format!(
-            "INSERT INTO conversation \
-            (conversation_id, workspace_id, thread_id, title, requirement, status, operator, last_message_preview, final_summary, last_error, created_at_ms, updated_at_ms) \
-            VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
-            ON DUPLICATE KEY UPDATE \
-              workspace_id = VALUES(workspace_id), \
-              thread_id = VALUES(thread_id), \
-              title = VALUES(title), \
-              requirement = VALUES(requirement), \
-              status = VALUES(status), \
-              operator = VALUES(operator), \
-              last_message_preview = VALUES(last_message_preview), \
-              final_summary = VALUES(final_summary), \
-              last_error = VALUES(last_error), \
-              updated_at_ms = VALUES(updated_at_ms)",
-            sql_string(&conversation.conversation_id),
-            sql_string(&conversation.workspace_id),
-            sql_string(&conversation.thread_id),
-            sql_string(&conversation.title),
-            sql_string(requirement),
-            sql_string(&conversation.status),
-            sql_option_string(conversation.operator.as_deref()),
-            sql_option_string(conversation.last_message_preview.as_deref()),
-            sql_option_string(conversation.final_summary.as_deref()),
-            sql_option_string(conversation.last_error.as_deref()),
-            sql_u64(conversation.created_at_ms),
-            sql_u64(conversation.updated_at_ms),
-        ))
-        .await
+        self.exec_sql(&build_upsert_conversation_sql(conversation, requirement))
+            .await
     }
 
     async fn upsert_task(
@@ -274,32 +285,7 @@ impl MySqlHistoryWriter {
         conversation_id: &str,
         task: &ServiceTaskRecord,
     ) -> Result<(), String> {
-        self.exec_sql(&format!(
-            "INSERT INTO conversation_task \
-            (conversation_id, task_id, workspace_id, thread_id, turn_id, status, created_thread, submitted_at_ms, completed_at_ms, last_error) \
-            VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
-            ON DUPLICATE KEY UPDATE \
-              conversation_id = VALUES(conversation_id), \
-              workspace_id = VALUES(workspace_id), \
-              thread_id = VALUES(thread_id), \
-              turn_id = VALUES(turn_id), \
-              status = VALUES(status), \
-              created_thread = VALUES(created_thread), \
-              submitted_at_ms = VALUES(submitted_at_ms), \
-              completed_at_ms = VALUES(completed_at_ms), \
-              last_error = VALUES(last_error)",
-            sql_string(conversation_id),
-            sql_string(&task.task_id),
-            sql_string(&task.workspace_id),
-            sql_string(&task.thread_id),
-            sql_option_string(task.turn_id.as_deref()),
-            sql_string(&task.status),
-            sql_string(if task.created_thread { "true" } else { "false" }),
-            sql_u64(task.submitted_at_ms),
-            sql_option_u64(task.completed_at_ms),
-            sql_option_string(task.last_error.as_deref()),
-        ))
-        .await
+        self.exec_sql(&build_upsert_task_sql(conversation_id, task)).await
     }
 
     async fn insert_message(
@@ -313,19 +299,15 @@ impl MySqlHistoryWriter {
         payload_json: Option<&str>,
         created_at_ms: u64,
     ) -> Result<(), String> {
-        self.exec_sql(&format!(
-            "INSERT INTO conversation_message \
-            (conversation_id, thread_id, turn_id, role, message_type, content, payload_json, sequence_no, created_at_ms) \
-            VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
-            sql_string(conversation_id),
-            sql_string(thread_id),
-            sql_option_string(turn_id),
-            sql_string(role),
-            sql_string(message_type),
-            sql_string(content),
-            sql_option_string(payload_json),
-            sql_u64(created_at_ms),
-            sql_u64(created_at_ms),
+        self.exec_sql(&build_insert_message_sql(
+            conversation_id,
+            thread_id,
+            turn_id,
+            role,
+            message_type,
+            content,
+            payload_json,
+            created_at_ms,
         ))
         .await
     }
@@ -340,17 +322,14 @@ impl MySqlHistoryWriter {
         payload_json: &str,
         created_at_ms: u64,
     ) -> Result<(), String> {
-        self.exec_sql(&format!(
-            "INSERT INTO conversation_event \
-            (conversation_id, thread_id, turn_id, event_type, event_status, payload_json, created_at_ms) \
-            VALUES ({}, {}, {}, {}, {}, {}, {})",
-            sql_string(conversation_id),
-            sql_string(thread_id),
-            sql_option_string(turn_id),
-            sql_string(event_type),
-            sql_option_string(event_status),
-            sql_string(payload_json),
-            sql_u64(created_at_ms),
+        self.exec_sql(&build_insert_event_sql(
+            conversation_id,
+            thread_id,
+            turn_id,
+            event_type,
+            event_status,
+            payload_json,
+            created_at_ms,
         ))
         .await
     }
@@ -415,8 +394,155 @@ fn sql_u64(value: u64) -> String {
     value.to_string()
 }
 
+fn sql_bool(value: bool) -> String {
+    if value { "1" } else { "0" }.to_string()
+}
+
 fn sql_option_u64(value: Option<u64>) -> String {
     value.map(sql_u64).unwrap_or_else(|| "NULL".to_string())
+}
+
+fn sql_null_safe_eq(column: &str, value_sql: &str) -> String {
+    format!("(({} = {}) OR ({} IS NULL AND {} IS NULL))", column, value_sql, column, value_sql)
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn build_upsert_conversation_sql(
+    conversation: &ServiceConversationRecord,
+    requirement: &str,
+) -> String {
+    format!(
+        "INSERT INTO conversation \
+        (conversation_id, workspace_id, thread_id, title, requirement, status, operator, last_message_preview, final_summary, last_error, created_at_ms, updated_at_ms) \
+        VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
+        ON DUPLICATE KEY UPDATE \
+          workspace_id = VALUES(workspace_id), \
+          thread_id = VALUES(thread_id), \
+          title = VALUES(title), \
+          requirement = VALUES(requirement), \
+          status = VALUES(status), \
+          operator = VALUES(operator), \
+          last_message_preview = VALUES(last_message_preview), \
+          final_summary = VALUES(final_summary), \
+          last_error = VALUES(last_error), \
+          updated_at_ms = VALUES(updated_at_ms)",
+        sql_string(&conversation.conversation_id),
+        sql_string(&conversation.workspace_id),
+        sql_string(&conversation.thread_id),
+        sql_string(&conversation.title),
+        sql_string(requirement),
+        sql_string(&conversation.status),
+        sql_option_string(conversation.operator.as_deref()),
+        sql_option_string(conversation.last_message_preview.as_deref()),
+        sql_option_string(conversation.final_summary.as_deref()),
+        sql_option_string(conversation.last_error.as_deref()),
+        sql_u64(conversation.created_at_ms),
+        sql_u64(conversation.updated_at_ms),
+    )
+}
+
+fn build_upsert_task_sql(conversation_id: &str, task: &ServiceTaskRecord) -> String {
+    format!(
+        "INSERT INTO conversation_task \
+        (conversation_id, task_id, workspace_id, thread_id, turn_id, status, created_thread, submitted_at_ms, completed_at_ms, last_error) \
+        VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
+        ON DUPLICATE KEY UPDATE \
+          conversation_id = VALUES(conversation_id), \
+          workspace_id = VALUES(workspace_id), \
+          thread_id = VALUES(thread_id), \
+          turn_id = VALUES(turn_id), \
+          status = VALUES(status), \
+          created_thread = VALUES(created_thread), \
+          submitted_at_ms = VALUES(submitted_at_ms), \
+          completed_at_ms = VALUES(completed_at_ms), \
+          last_error = VALUES(last_error)",
+        sql_string(conversation_id),
+        sql_string(&task.task_id),
+        sql_string(&task.workspace_id),
+        sql_string(&task.thread_id),
+        sql_option_string(task.turn_id.as_deref()),
+        sql_string(&task.status),
+        sql_bool(task.created_thread),
+        sql_u64(task.submitted_at_ms),
+        sql_option_u64(task.completed_at_ms),
+        sql_option_string(task.last_error.as_deref()),
+    )
+}
+
+fn build_insert_message_sql(
+    conversation_id: &str,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    role: &str,
+    message_type: &str,
+    content: &str,
+    payload_json: Option<&str>,
+    created_at_ms: u64,
+) -> String {
+    let conversation_id_sql = sql_string(conversation_id);
+    let thread_id_sql = sql_string(thread_id);
+    let turn_id_sql = sql_option_string(turn_id);
+    let role_sql = sql_string(role);
+    let message_type_sql = sql_string(message_type);
+    let content_sql = sql_string(content);
+    let payload_json_sql = sql_option_string(payload_json);
+    let created_at_ms_sql = sql_u64(created_at_ms);
+    format!(
+        "INSERT INTO conversation_message \
+        (conversation_id, thread_id, turn_id, role, message_type, content, payload_json, sequence_no, created_at_ms) \
+        SELECT {conversation_id_sql}, {thread_id_sql}, {turn_id_sql}, {role_sql}, {message_type_sql}, {content_sql}, {payload_json_sql}, {created_at_ms_sql}, {created_at_ms_sql} \
+        FROM DUAL WHERE NOT EXISTS (\
+            SELECT 1 FROM conversation_message WHERE \
+              conversation_id = {conversation_id_sql} AND \
+              thread_id = {thread_id_sql} AND \
+              {turn_id_match} AND \
+              role = {role_sql} AND \
+              message_type = {message_type_sql} AND \
+              content = {content_sql} AND \
+              {payload_json_match}\
+        )",
+        turn_id_match = sql_null_safe_eq("turn_id", &turn_id_sql),
+        payload_json_match = sql_null_safe_eq("payload_json", &payload_json_sql),
+    )
+}
+
+fn build_insert_event_sql(
+    conversation_id: &str,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    event_type: &str,
+    event_status: Option<&str>,
+    payload_json: &str,
+    created_at_ms: u64,
+) -> String {
+    let conversation_id_sql = sql_string(conversation_id);
+    let thread_id_sql = sql_string(thread_id);
+    let turn_id_sql = sql_option_string(turn_id);
+    let event_type_sql = sql_string(event_type);
+    let event_status_sql = sql_option_string(event_status);
+    let payload_json_sql = sql_string(payload_json);
+    let created_at_ms_sql = sql_u64(created_at_ms);
+    format!(
+        "INSERT INTO conversation_event \
+        (conversation_id, thread_id, turn_id, event_type, event_status, payload_json, created_at_ms) \
+        SELECT {conversation_id_sql}, {thread_id_sql}, {turn_id_sql}, {event_type_sql}, {event_status_sql}, {payload_json_sql}, {created_at_ms_sql} \
+        FROM DUAL WHERE NOT EXISTS (\
+            SELECT 1 FROM conversation_event WHERE \
+              conversation_id = {conversation_id_sql} AND \
+              thread_id = {thread_id_sql} AND \
+              {turn_id_match} AND \
+              event_type = {event_type_sql} AND \
+              {event_status_match} AND \
+              payload_json = {payload_json_sql}\
+        )",
+        turn_id_match = sql_null_safe_eq("turn_id", &turn_id_sql),
+        event_status_match = sql_null_safe_eq("event_status", &event_status_sql),
+    )
 }
 
 fn sql_escape(value: &str) -> String {
@@ -435,16 +561,32 @@ fn sql_escape(value: &str) -> String {
     escaped
 }
 
+fn resolve_conversation_id_from_records(
+    conversations: &[ServiceConversationRecord],
+    workspace_id: &str,
+    thread_id: &str,
+) -> Option<String> {
+    conversations
+        .iter()
+        .filter(|conversation| {
+            conversation.workspace_id == workspace_id && conversation.thread_id == thread_id
+        })
+        .max_by_key(|conversation| conversation.updated_at_ms)
+        .map(|conversation| conversation.conversation_id.clone())
+}
+
 impl DaemonState {
     fn load(config: &DaemonConfig, event_sink: DaemonEventSink) -> Self {
         let storage_path = config.data_dir.join("workspaces.json");
         let settings_path = config.data_dir.join("settings.json");
         let tasks_path = config.data_dir.join("service_tasks.json");
         let conversations_path = config.data_dir.join("service_conversations.json");
+        let mysql_retry_path = config.data_dir.join("service_mysql_retry.json");
         let workspaces = read_workspaces(&storage_path).unwrap_or_default();
         let app_settings = read_settings(&settings_path).unwrap_or_default();
         let tasks = load_service_tasks(&tasks_path);
         let conversations = load_service_conversations(&conversations_path);
+        let mysql_retry_queue = load_pending_mysql_writes(&mysql_retry_path);
         let mysql_history = MySqlHistoryWriter::from_env();
         let daemon_binary_path = std::env::current_exe()
             .ok()
@@ -457,10 +599,13 @@ impl DaemonState {
             conversations: Mutex::new(conversations),
             tasks_path,
             conversations_path,
+            mysql_retry_path,
             storage_path,
             settings_path,
             app_settings: Mutex::new(app_settings),
             mysql_history,
+            mysql_retry_queue: Mutex::new(mysql_retry_queue),
+            mysql_retry_flush_lock: Mutex::new(()),
             event_sink,
             codex_login_cancels: Mutex::new(HashMap::new()),
             daemon_binary_path,
@@ -474,6 +619,29 @@ impl DaemonState {
             "pid": std::process::id(),
             "mode": "tcp",
             "binaryPath": self.daemon_binary_path,
+            "mysqlRetry": self.mysql_retry_status_snapshot(),
+        })
+    }
+
+    fn mysql_retry_status_snapshot(&self) -> Value {
+        let queue = self
+            .mysql_retry_queue
+            .try_lock()
+            .map(|queue| queue.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let pending = queue.len();
+        let max_attempt_count = queue.iter().map(|entry| entry.attempt_count).max().unwrap_or(0);
+        let oldest_created_at_ms = queue.iter().map(|entry| entry.created_at_ms).min();
+        let latest_error = queue
+            .iter()
+            .max_by_key(|entry| entry.updated_at_ms)
+            .and_then(|entry| entry.last_error.clone());
+        json!({
+            "enabled": self.mysql_history.is_some(),
+            "pending": pending,
+            "maxAttemptCount": max_attempt_count,
+            "oldestCreatedAtMs": oldest_created_at_ms,
+            "latestError": latest_error,
         })
     }
 
@@ -552,10 +720,8 @@ impl DaemonState {
             )
             .await?;
         Ok(json!({
-            "conversationId": conversation_id,
-            "workspaceId": conversation.workspace_id,
-            "threadId": conversation.thread_id,
-            "messages": messages,
+            "conversation": conversation,
+            "messages": normalize_thread_messages(messages),
         }))
     }
 
@@ -625,19 +791,138 @@ impl DaemonState {
         }
     }
 
+    fn persist_mysql_retry_queue_locked(
+        &self,
+        queue: &HashMap<String, PendingMySqlWrite>,
+    ) {
+        if let Err(err) = write_pending_mysql_writes(&self.mysql_retry_path, queue) {
+            eprintln!(
+                "daemon: failed to persist mysql retry queue to {}: {err}",
+                self.mysql_retry_path.display()
+            );
+        }
+    }
+
+    async fn enqueue_mysql_retry(&self, key: String, kind: &str, sql: String, error_message: String) {
+        let now = current_timestamp_ms();
+        let mut queue = self.mysql_retry_queue.lock().await;
+        let entry = queue.entry(key.clone()).or_insert_with(|| PendingMySqlWrite {
+            key: key.clone(),
+            kind: kind.to_string(),
+            sql: sql.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            attempt_count: 0,
+            last_error: None,
+        });
+        entry.kind = kind.to_string();
+        entry.sql = sql;
+        entry.updated_at_ms = now;
+        entry.attempt_count = entry.attempt_count.saturating_add(1);
+        entry.last_error = Some(error_message);
+        self.persist_mysql_retry_queue_locked(&queue);
+    }
+
+    async fn clear_mysql_retry(&self, key: &str) {
+        let mut queue = self.mysql_retry_queue.lock().await;
+        if queue.remove(key).is_some() {
+            self.persist_mysql_retry_queue_locked(&queue);
+        }
+    }
+
+    async fn flush_mysql_retry_queue(&self) {
+        let Some(writer) = self.mysql_history.clone() else {
+            return;
+        };
+        let _flush_guard = self.mysql_retry_flush_lock.lock().await;
+        let pending = self
+            .mysql_retry_queue
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+
+        let mut recovered = 0usize;
+        for entry in pending {
+            match writer.exec_sql(&entry.sql).await {
+                Ok(()) => {
+                    recovered += 1;
+                    self.clear_mysql_retry(&entry.key).await;
+                }
+                Err(err) => {
+                    let mut queue = self.mysql_retry_queue.lock().await;
+                    if let Some(pending_entry) = queue.get_mut(&entry.key) {
+                        pending_entry.updated_at_ms = current_timestamp_ms();
+                        pending_entry.attempt_count = pending_entry.attempt_count.saturating_add(1);
+                        pending_entry.last_error = Some(err.clone());
+                    }
+                    self.persist_mysql_retry_queue_locked(&queue);
+                    eprintln!(
+                        "daemon: mysql retry still failing for {} {}: {err}",
+                        entry.kind, entry.key
+                    );
+                }
+            }
+        }
+        if recovered > 0 {
+            let remaining = self.mysql_retry_queue.lock().await.len();
+            eprintln!(
+                "daemon: recovered {recovered} pending mysql writes (remaining: {remaining})"
+            );
+        }
+    }
+
+    async fn run_mysql_retry_worker(self: Arc<Self>) {
+        if self.mysql_history.is_none() {
+            return;
+        }
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            self.flush_mysql_retry_queue().await;
+            let snapshot = self.mysql_retry_status_snapshot();
+            let pending = snapshot
+                .get("pending")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if pending > 0 {
+                let max_attempt_count = snapshot
+                    .get("maxAttemptCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let latest_error = snapshot
+                    .get("latestError")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown mysql error");
+                eprintln!(
+                    "daemon: mysql retry backlog pending={} max_attempts={} latest_error={}",
+                    pending, max_attempt_count, latest_error
+                );
+            }
+        }
+    }
+
     async fn persist_conversation_history(&self, conversation: &ServiceConversationRecord) {
         let Some(writer) = self.mysql_history.clone() else {
             return;
         };
-        if let Err(err) = writer
-            .upsert_conversation(conversation, &conversation.requirement)
-            .await
-        {
+        let retry_key = format!("conversation:{}", conversation.conversation_id);
+        let sql = build_upsert_conversation_sql(conversation, &conversation.requirement);
+        if let Err(err) = writer.exec_sql(&sql).await {
             eprintln!(
                 "daemon: failed to persist conversation {} to mysql: {err}",
                 conversation.conversation_id
             );
+            self.enqueue_mysql_retry(retry_key, "conversation", sql, err).await;
+            return;
         }
+        self.clear_mysql_retry(&retry_key).await;
+        self.flush_mysql_retry_queue().await;
     }
 
     async fn persist_task_history(&self, task: &ServiceTaskRecord) {
@@ -650,12 +935,18 @@ impl DaemonState {
         let Some(conversation_id) = conversation_id else {
             return;
         };
-        if let Err(err) = writer.upsert_task(&conversation_id, task).await {
+        let retry_key = format!("task:{}", task.task_id);
+        let sql = build_upsert_task_sql(&conversation_id, task);
+        if let Err(err) = writer.exec_sql(&sql).await {
             eprintln!(
                 "daemon: failed to persist task {} to mysql: {err}",
                 task.task_id
             );
+            self.enqueue_mysql_retry(retry_key, "task", sql, err).await;
+            return;
         }
+        self.clear_mysql_retry(&retry_key).await;
+        self.flush_mysql_retry_queue().await;
     }
 
     async fn persist_message_history(
@@ -672,24 +963,27 @@ impl DaemonState {
         let Some(writer) = self.mysql_history.clone() else {
             return;
         };
-        if let Err(err) = writer
-            .insert_message(
-                conversation_id,
-                thread_id,
-                turn_id,
-                role,
-                message_type,
-                content,
-                payload_json,
-                created_at_ms,
-            )
-            .await
-        {
+        let sql = build_insert_message_sql(
+            conversation_id,
+            thread_id,
+            turn_id,
+            role,
+            message_type,
+            content,
+            payload_json,
+            created_at_ms,
+        );
+        let retry_key = format!("message:{:016x}", stable_hash(&sql));
+        if let Err(err) = writer.exec_sql(&sql).await {
             eprintln!(
                 "daemon: failed to persist conversation message {} to mysql: {err}",
                 conversation_id
             );
+            self.enqueue_mysql_retry(retry_key, "message", sql, err).await;
+            return;
         }
+        self.clear_mysql_retry(&retry_key).await;
+        self.flush_mysql_retry_queue().await;
     }
 
     async fn persist_event_history(
@@ -705,23 +999,26 @@ impl DaemonState {
         let Some(writer) = self.mysql_history.clone() else {
             return;
         };
-        if let Err(err) = writer
-            .insert_event(
-                conversation_id,
-                thread_id,
-                turn_id,
-                event_type,
-                event_status,
-                payload_json,
-                created_at_ms,
-            )
-            .await
-        {
+        let sql = build_insert_event_sql(
+            conversation_id,
+            thread_id,
+            turn_id,
+            event_type,
+            event_status,
+            payload_json,
+            created_at_ms,
+        );
+        let retry_key = format!("event:{:016x}", stable_hash(&sql));
+        if let Err(err) = writer.exec_sql(&sql).await {
             eprintln!(
                 "daemon: failed to persist conversation event {} to mysql: {err}",
                 conversation_id
             );
+            self.enqueue_mysql_retry(retry_key, "event", sql, err).await;
+            return;
         }
+        self.clear_mysql_retry(&retry_key).await;
+        self.flush_mysql_retry_queue().await;
     }
 
     async fn resolve_conversation_id(
@@ -729,15 +1026,189 @@ impl DaemonState {
         workspace_id: &str,
         thread_id: &str,
     ) -> Option<String> {
-        self.conversations
+        let conversations = self
+            .conversations
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        resolve_conversation_id_from_records(&conversations, workspace_id, thread_id)
+    }
+
+    async fn reconcile_history_projection(&self) {
+        let Some(writer) = self.mysql_history.clone() else {
+            return;
+        };
+        let conversations = self
+            .conversations
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let tasks = self
+            .tasks
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut conversation_ok = 0usize;
+        let mut task_ok = 0usize;
+        for conversation in &conversations {
+            if let Err(err) = writer
+                .upsert_conversation(conversation, &conversation.requirement)
+                .await
+            {
+                eprintln!(
+                    "daemon: failed to reconcile conversation {} to mysql: {err}",
+                    conversation.conversation_id
+                );
+            } else {
+                conversation_ok += 1;
+            }
+        }
+        for task in &tasks {
+            let Some(conversation_id) =
+                resolve_conversation_id_from_records(&conversations, &task.workspace_id, &task.thread_id)
+            else {
+                continue;
+            };
+            if let Err(err) = writer.upsert_task(&conversation_id, task).await {
+                eprintln!(
+                    "daemon: failed to reconcile task {} to mysql: {err}",
+                    task.task_id
+                );
+            } else {
+                task_ok += 1;
+            }
+        }
+        eprintln!(
+            "daemon: reconciled history projection to mysql (conversations: {conversation_ok}/{}, tasks: {task_ok}/{})",
+            conversations.len(),
+            tasks.len()
+        );
+    }
+
+    async fn backfill_history_to_mysql(
+        &self,
+        workspace_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<HistoryBackfillReport, String> {
+        if self.mysql_history.is_none() {
+            return Err("mysql history is not enabled".to_string());
+        }
+
+        let conversations = self
+            .conversations
             .lock()
             .await
             .values()
             .filter(|conversation| {
-                conversation.workspace_id == workspace_id && conversation.thread_id == thread_id
+                workspace_id
+                    .map(|value| conversation.workspace_id == value)
+                    .unwrap_or(true)
+                    && conversation_id
+                        .map(|value| conversation.conversation_id == value)
+                        .unwrap_or(true)
             })
-            .max_by_key(|conversation| conversation.updated_at_ms)
-            .map(|conversation| conversation.conversation_id.clone())
+            .cloned()
+            .collect::<Vec<_>>();
+        let tasks = self
+            .tasks
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut report = HistoryBackfillReport {
+            conversations_selected: conversations.len(),
+            ..HistoryBackfillReport::default()
+        };
+
+        for conversation in &conversations {
+            self.persist_conversation_history(conversation).await;
+            report.conversations_upserted += 1;
+        }
+
+        for task in tasks.iter().filter(|task| {
+            conversations.iter().any(|conversation| {
+                conversation.workspace_id == task.workspace_id
+                    && conversation.thread_id == task.thread_id
+            })
+        }) {
+            self.persist_task_history(task).await;
+            report.tasks_upserted += 1;
+        }
+
+        for conversation in conversations {
+            if ensure_workspace_connected_for_http(self, &conversation.workspace_id)
+                .await
+                .is_err()
+            {
+                report.conversations_failed += 1;
+                continue;
+            }
+
+            let thread = match self
+                .read_thread(
+                    conversation.workspace_id.clone(),
+                    conversation.thread_id.clone(),
+                )
+                .await
+            {
+                Ok(thread) => thread,
+                Err(_) => {
+                    report.conversations_failed += 1;
+                    continue;
+                }
+            };
+
+            let messages = collect_history_backfill_messages(thread);
+            if messages.is_empty() {
+                continue;
+            }
+
+            for message in messages {
+                let sql = build_insert_message_sql(
+                    &conversation.conversation_id,
+                    &conversation.thread_id,
+                    message.turn_id.as_deref(),
+                    &message.role,
+                    &message.message_type,
+                    &message.content,
+                    message.payload_json.as_deref(),
+                    message.created_at_ms,
+                );
+                let retry_key = format!("message:{:016x}", stable_hash(&sql));
+                self.persist_message_history(
+                    &conversation.conversation_id,
+                    &conversation.thread_id,
+                    message.turn_id.as_deref(),
+                    &message.role,
+                    &message.message_type,
+                    &message.content,
+                    message.payload_json.as_deref(),
+                    message.created_at_ms,
+                )
+                .await;
+                let failed = self
+                    .mysql_retry_queue
+                    .lock()
+                    .await
+                    .contains_key(&retry_key);
+                if failed {
+                    report.message_failures += 1;
+                } else {
+                    report.messages_backfilled += 1;
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     async fn mark_task_running(
@@ -2268,11 +2739,28 @@ struct HttpConversationMessageRequest {
     collaboration_mode: Option<Value>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HttpHistoryBackfillRequest {
+    workspace_id: Option<String>,
+    conversation_id: Option<String>,
+}
+
 fn current_timestamp_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|value| value.as_millis() as u64)
         .unwrap_or_default()
+}
+
+fn parse_timestamp_ms(value: Option<&Value>) -> Option<u64> {
+    let text = value?.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|ts| ts.timestamp_millis().max(0) as u64)
 }
 
 fn load_service_tasks(path: &PathBuf) -> HashMap<String, ServiceTaskRecord> {
@@ -2339,6 +2827,39 @@ fn load_service_conversations(path: &PathBuf) -> HashMap<String, ServiceConversa
         .collect()
 }
 
+fn load_pending_mysql_writes(path: &PathBuf) -> HashMap<String, PendingMySqlWrite> {
+    if !path.exists() {
+        return HashMap::new();
+    }
+
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "daemon: failed to read mysql retry queue from {}: {err}",
+                path.display()
+            );
+            return HashMap::new();
+        }
+    };
+
+    let records: Vec<PendingMySqlWrite> = match serde_json::from_str(&data) {
+        Ok(records) => records,
+        Err(err) => {
+            eprintln!(
+                "daemon: failed to deserialize mysql retry queue from {}: {err}",
+                path.display()
+            );
+            return HashMap::new();
+        }
+    };
+
+    records
+        .into_iter()
+        .map(|record| (record.key.clone(), record))
+        .collect()
+}
+
 fn write_service_tasks(
     path: &PathBuf,
     tasks: &HashMap<String, ServiceTaskRecord>,
@@ -2352,6 +2873,24 @@ fn write_service_tasks(
         a.submitted_at_ms
             .cmp(&b.submitted_at_ms)
             .then_with(|| a.task_id.cmp(&b.task_id))
+    });
+    let data = serde_json::to_string_pretty(&records).map_err(|err| err.to_string())?;
+    std::fs::write(path, data).map_err(|err| err.to_string())
+}
+
+fn write_pending_mysql_writes(
+    path: &PathBuf,
+    writes: &HashMap<String, PendingMySqlWrite>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+
+    let mut records = writes.values().cloned().collect::<Vec<_>>();
+    records.sort_by(|a, b| {
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| a.key.cmp(&b.key))
     });
     let data = serde_json::to_string_pretty(&records).map_err(|err| err.to_string())?;
     std::fs::write(path, data).map_err(|err| err.to_string())
@@ -2468,27 +3007,58 @@ fn extract_task_error_message(message: &Value) -> Option<String> {
 fn map_conversation_status(method: &str, message: &Value) -> Option<String> {
     match method {
         "thread/started" => Some("thread_created".to_string()),
-        "turn/started" => Some("running".to_string()),
+        "turn/started" | "item/started" => Some("running".to_string()),
         "turn/completed" => Some("completed".to_string()),
         "error" | "turn/error" => Some("failed".to_string()),
+        "thread/status/changed" => match extract_thread_status_type(message).as_deref() {
+            Some("active") => Some("running".to_string()),
+            Some("systemerror") => Some("failed".to_string()),
+            _ => None,
+        },
         _ if has_waiting_input_payload(message) => Some("waiting_input".to_string()),
         _ if has_waiting_approval_payload(message) => Some("waiting_approval".to_string()),
-        _ if has_streaming_payload(message) => Some("streaming".to_string()),
+        _ if is_streaming_method(method) => Some("streaming".to_string()),
         _ => None,
     }
 }
 
-fn has_streaming_payload(message: &Value) -> bool {
-    message
-        .get("method")
-        .and_then(Value::as_str)
-        .map(|method| {
-            method.contains("delta")
-                || method.contains("stream")
-                || method.contains("message/updated")
-                || method.contains("turn/text")
-        })
-        .unwrap_or(false)
+fn extract_thread_status_type(message: &Value) -> Option<String> {
+    let status = message.get("params")?.get("status")?;
+    if let Some(value) = status.as_str() {
+        return Some(
+            value
+                .trim()
+                .to_lowercase()
+                .replace([' ', '_', '-'], ""),
+        );
+    }
+    let value = status
+        .get("type")
+        .or_else(|| status.get("statusType"))
+        .or_else(|| status.get("status_type"))?
+        .as_str()?;
+    Some(
+        value
+            .trim()
+            .to_lowercase()
+            .replace([' ', '_', '-'], ""),
+    )
+}
+
+fn is_streaming_method(method: &str) -> bool {
+    matches!(
+        method,
+        "item/agentMessage/delta"
+            | "item/commandExecution/outputDelta"
+            | "item/fileChange/outputDelta"
+            | "item/plan/delta"
+            | "item/reasoning/summaryPartAdded"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/textDelta"
+            | "turn/diff/updated"
+            | "turn/plan/updated"
+    ) || method.contains("stream")
+        || method.contains("turn/text")
 }
 
 fn has_waiting_input_payload(message: &Value) -> bool {
@@ -2632,8 +3202,299 @@ fn http_json_response(status: &str, body: Value) -> String {
     )
 }
 
+fn http_api_success_response(status: &str, data: Value, meta: Option<Value>) -> String {
+    let mut body = serde_json::Map::new();
+    body.insert("ok".to_string(), Value::Bool(true));
+    body.insert("data".to_string(), data);
+    if let Some(meta) = meta {
+        body.insert("meta".to_string(), meta);
+    }
+    http_json_response(status, Value::Object(body))
+}
+
+fn http_api_error_response(status: &str, code: &str, message: &str) -> String {
+    http_json_response(
+        status,
+        json!({
+            "ok": false,
+            "error": {
+                "code": code,
+                "message": message
+            }
+        }),
+    )
+}
+
 fn http_error_response(status: &str, message: &str) -> String {
     http_json_response(status, json!({ "error": message }))
+}
+
+fn normalize_thread_messages(value: Value) -> Value {
+    if let Some(items) = value.get("items").and_then(Value::as_array) {
+        return Value::Array(items.clone());
+    }
+    if let Some(items) = value.as_array() {
+        return Value::Array(items.clone());
+    }
+    if let Some(items) = extract_session_messages(&value) {
+        return Value::Array(items);
+    }
+    Value::Array(Vec::new())
+}
+
+fn collect_history_backfill_messages(value: Value) -> Vec<HistoryBackfillMessage> {
+    let Value::Array(items) = normalize_thread_messages(value) else {
+        return Vec::new();
+    };
+    items.into_iter()
+        .filter_map(|item| {
+            let object = item.as_object()?;
+            let role = match object.get("type").and_then(Value::as_str) {
+                Some("user") => "user",
+                Some("assistant") => "assistant",
+                _ => return None,
+            };
+            let content = object
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())?
+                .to_string();
+            let turn_id = object
+                .get("turnId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let message_type = object
+                .get("phase")
+                .and_then(Value::as_str)
+                .filter(|phase| !phase.trim().is_empty())
+                .unwrap_or("message")
+                .to_string();
+            let payload_json = serde_json::to_string(&item).ok();
+            let created_at_ms =
+                parse_timestamp_ms(object.get("timestamp")).unwrap_or_else(current_timestamp_ms);
+            Some(HistoryBackfillMessage {
+                turn_id,
+                role: role.to_string(),
+                message_type,
+                content,
+                payload_json,
+                created_at_ms,
+            })
+        })
+        .collect()
+}
+
+fn extract_session_messages(value: &Value) -> Option<Vec<Value>> {
+    let path = value
+        .get("result")
+        .and_then(|result| result.get("thread"))
+        .and_then(|thread| thread.get("path"))
+        .or_else(|| {
+            value.get("thread")
+                .and_then(|thread| thread.get("path"))
+        })
+        .and_then(Value::as_str)?
+        .trim();
+    if path.is_empty() {
+        return None;
+    }
+
+    let file = File::open(path).ok()?;
+    let reader = StdBufReader::new(file);
+    let mut known_turn_ids = HashSet::new();
+    let mut current_turn_id: Option<String> = None;
+    let mut event_messages = Vec::new();
+    let mut messages = Vec::new();
+
+    for (index, line) in reader.lines().enumerate() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let entry_type = entry.get("type").and_then(Value::as_str).unwrap_or_default();
+        if entry_type == "event_msg" {
+            let payload = entry.get("payload");
+            let payload_type = payload
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str);
+            match payload_type {
+                Some("task_started") => {
+                    if let Some(turn_id) = payload
+                        .and_then(|payload| payload.get("turn_id"))
+                        .and_then(Value::as_str)
+                    {
+                        let turn_id = turn_id.to_string();
+                        known_turn_ids.insert(turn_id.clone());
+                        current_turn_id = Some(turn_id);
+                    }
+                }
+                Some("task_complete") => {
+                    let completed_turn_id = payload
+                        .and_then(|payload| payload.get("turn_id"))
+                        .and_then(Value::as_str);
+                    if completed_turn_id == current_turn_id.as_deref() {
+                        current_turn_id = None;
+                    }
+                }
+                Some("user_message") | Some("agent_message") => {
+                    let role = if payload_type == Some("user_message") {
+                        "user"
+                    } else {
+                        "assistant"
+                    };
+                    let text_key = if payload_type == Some("user_message") {
+                        "message"
+                    } else {
+                        "message"
+                    };
+                    let Some(turn_id) = current_turn_id.clone() else {
+                        continue;
+                    };
+                    let Some(text) = payload
+                        .and_then(|payload| payload.get(text_key))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                    else {
+                        continue;
+                    };
+                    let mut message = serde_json::Map::new();
+                    message.insert(
+                        "id".to_string(),
+                        Value::String(format!("session-event-message-{}", index + 1)),
+                    );
+                    message.insert("type".to_string(), Value::String(role.to_string()));
+                    message.insert("text".to_string(), Value::String(text.to_string()));
+                    message.insert("turnId".to_string(), Value::String(turn_id));
+                    if let Some(timestamp) = entry.get("timestamp").and_then(Value::as_str) {
+                        message.insert("timestamp".to_string(), Value::String(timestamp.to_string()));
+                    }
+                    if let Some(phase) = payload
+                        .and_then(|payload| payload.get("phase"))
+                        .and_then(Value::as_str)
+                    {
+                        message.insert("phase".to_string(), Value::String(phase.to_string()));
+                    }
+                    event_messages.push(Value::Object(message));
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if entry_type != "response_item" {
+            continue;
+        }
+
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let role = match payload.get("role").and_then(Value::as_str) {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            _ => continue,
+        };
+        let Some(turn_id) = payload
+            .get("internal_chat_message_metadata_passthrough")
+            .and_then(|meta| meta.get("turn_id"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if !known_turn_ids.contains(turn_id) {
+            continue;
+        }
+        let Some(text) = extract_message_text(payload.get("content")) else {
+            continue;
+        };
+        let id = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("session-message-{}", index + 1));
+        let mut message = serde_json::Map::new();
+        message.insert("id".to_string(), Value::String(id));
+        message.insert("type".to_string(), Value::String(role.to_string()));
+        message.insert("text".to_string(), Value::String(text));
+        message.insert("turnId".to_string(), Value::String(turn_id.to_string()));
+        if let Some(timestamp) = entry.get("timestamp").and_then(Value::as_str) {
+            message.insert("timestamp".to_string(), Value::String(timestamp.to_string()));
+        }
+        if let Some(phase) = payload.get("phase").and_then(Value::as_str) {
+            message.insert("phase".to_string(), Value::String(phase.to_string()));
+        }
+        messages.push(Value::Object(message));
+    }
+
+    if !event_messages.is_empty() {
+        Some(event_messages)
+    } else if !messages.is_empty() {
+        Some(messages)
+    } else {
+        None
+    }
+}
+
+fn extract_message_text(content: Option<&Value>) -> Option<String> {
+    let items = content?.as_array()?;
+    let parts = items
+        .iter()
+        .filter_map(|item| {
+            let item_type = item.get("type").and_then(Value::as_str)?;
+            if !matches!(item_type, "input_text" | "output_text" | "text") {
+                return None;
+            }
+            item.get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn conversation_http_error_response(message: &str) -> String {
+    match message {
+        "missing `title`" => {
+            http_api_error_response("400 Bad Request", "missing_title", message)
+        }
+        "missing `requirement`" => {
+            http_api_error_response("400 Bad Request", "missing_requirement", message)
+        }
+        "missing `text`" => http_api_error_response("400 Bad Request", "missing_text", message),
+        "missing `conversationId`" => {
+            http_api_error_response("400 Bad Request", "missing_conversation_id", message)
+        }
+        "conversation not found" => {
+            http_api_error_response("404 Not Found", "conversation_not_found", message)
+        }
+        "workspace not found" => {
+            http_api_error_response("404 Not Found", "workspace_not_found", message)
+        }
+        "workspace not connected" => {
+            http_api_error_response("409 Conflict", "workspace_not_connected", message)
+        }
+        "start_thread response missing `threadId`" => http_api_error_response(
+            "502 Bad Gateway",
+            "upstream_protocol_error",
+            message,
+        ),
+        _ => http_api_error_response("500 Internal Server Error", "internal_error", message),
+    }
 }
 
 fn parse_http_query(query: Option<&str>) -> HashMap<String, String> {
@@ -2930,12 +3791,16 @@ async fn handle_http_conversation_start(
             last_error: None,
         })
         .await;
-    let _ = state.mark_task_running(&task.task_id, turn_id).await;
-    let _ = state
+    let task = state
+        .mark_task_running(&task.task_id, turn_id)
+        .await
+        .unwrap_or(task);
+    let conversation = state
         .update_conversation(&conversation.conversation_id, |conversation| {
             conversation.status = "thread_created".to_string();
         })
-        .await;
+        .await
+        .unwrap_or(conversation);
     let start_event_payload = serde_json::to_string(&json!({
         "title": &conversation.title,
         "requirement": &requirement,
@@ -2967,11 +3832,8 @@ async fn handle_http_conversation_start(
         .await;
 
     Ok(json!({
-        "conversationId": conversation.conversation_id,
-        "workspaceId": conversation.workspace_id,
-        "threadId": conversation.thread_id,
-        "taskId": task.task_id,
-        "status": "accepted",
+        "conversation": conversation,
+        "task": task,
     }))
 }
 
@@ -3018,15 +3880,19 @@ async fn handle_http_conversation_message(
             last_error: None,
         })
         .await;
-    let _ = state.mark_task_running(&task.task_id, turn_id).await;
+    let task = state
+        .mark_task_running(&task.task_id, turn_id)
+        .await
+        .unwrap_or(task);
     let preview = preview_text(&text);
-    let _ = state
+    let conversation = state
         .update_conversation(conversation_id, move |conversation| {
             conversation.last_message_preview = preview.clone();
             conversation.status = "accepted".to_string();
             conversation.last_error = None;
         })
-        .await;
+        .await
+        .unwrap_or(conversation);
     let now = current_timestamp_ms();
     let message_event_payload = serde_json::to_string(&json!({
         "text": &text,
@@ -3058,11 +3924,23 @@ async fn handle_http_conversation_message(
         .await;
 
     Ok(json!({
-        "conversationId": conversation_id,
-        "workspaceId": conversation.workspace_id,
-        "threadId": conversation.thread_id,
-        "taskId": task.task_id,
-        "status": "accepted",
+        "conversation": conversation,
+        "task": task,
+    }))
+}
+
+async fn handle_http_history_backfill(
+    state: &DaemonState,
+    request: HttpHistoryBackfillRequest,
+) -> Result<Value, String> {
+    let report = state
+        .backfill_history_to_mysql(
+            request.workspace_id.as_deref(),
+            request.conversation_id.as_deref(),
+        )
+        .await?;
+    Ok(json!({
+        "backfill": report,
     }))
 }
 
@@ -3365,7 +4243,8 @@ async fn handle_http_request(
                     json!({
                         "ok": true,
                         "daemon": state.daemon_info(),
-                        "http": true
+                        "http": true,
+                        "mysqlRetry": state.mysql_retry_status_snapshot(),
                     }),
                 )
             } else if method == "GET" && path == "/api/v1/health" {
@@ -3375,12 +4254,37 @@ async fn handle_http_request(
                         "ok": true,
                         "daemon": state.daemon_info(),
                         "http": true,
-                        "version": "v1"
+                        "version": "v1",
+                        "mysqlRetry": state.mysql_retry_status_snapshot(),
                     }),
                 )
             } else if method == "GET" && path == "/api/workspaces" {
                 let workspaces = state.list_workspaces().await;
                 http_json_response("200 OK", json!({ "workspaces": workspaces }))
+            } else if method == "POST" && path == "/api/v1/history/backfill" {
+                let request = if body.is_empty() {
+                    HttpHistoryBackfillRequest::default()
+                } else {
+                    match serde_json::from_slice::<HttpHistoryBackfillRequest>(&body) {
+                        Ok(request) => request,
+                        Err(err) => {
+                            let response = http_api_error_response(
+                                "400 Bad Request",
+                                "invalid_json",
+                                &err.to_string(),
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            return;
+                        }
+                    }
+                };
+                match handle_http_history_backfill(&state, request).await {
+                    Ok(result) => http_api_success_response("200 OK", result, None),
+                    Err(err) if err == "mysql history is not enabled" => {
+                        http_api_error_response("409 Conflict", "mysql_history_disabled", &err)
+                    }
+                    Err(err) => http_api_error_response("500 Internal Server Error", "internal_error", &err),
+                }
             } else if method == "POST" && path == "/api/v1/tasks" {
                 match serde_json::from_slice::<HttpCreateTaskRequest>(&body) {
                     Ok(request) => match handle_http_create_task(&state, request).await {
@@ -3405,18 +4309,21 @@ async fn handle_http_request(
             } else if method == "POST" && path == "/api/v1/conversations/start" {
                 match serde_json::from_slice::<HttpConversationStartRequest>(&body) {
                     Ok(request) => match handle_http_conversation_start(&state, request).await {
-                        Ok(result) => http_json_response("200 OK", result),
-                        Err(err) => http_error_response("400 Bad Request", &err),
+                        Ok(result) => http_api_success_response("202 Accepted", result, None),
+                        Err(err) => conversation_http_error_response(&err),
                     },
-                    Err(err) => http_error_response("400 Bad Request", &err.to_string()),
+                    Err(err) => {
+                        http_api_error_response("400 Bad Request", "invalid_json", &err.to_string())
+                    }
                 }
             } else if method == "GET" && path == "/api/v1/conversations" {
                 let query_map = parse_http_query(query.as_deref());
                 let workspace_id = query_map.get("workspaceId").map(String::as_str);
                 let conversations = state.list_conversations(workspace_id).await;
-                http_json_response(
+                http_api_success_response(
                     "200 OK",
-                    json!({ "items": conversations, "conversations": conversations }),
+                    json!({ "items": conversations }),
+                    Some(json!({ "count": conversations.len() })),
                 )
             } else if method == "POST"
                 && path.starts_with("/api/v1/conversations/")
@@ -3428,21 +4335,22 @@ async fn handle_http_request(
                     .trim_end_matches('/')
                     .to_string();
                 if conversation_id.is_empty() {
-                    http_error_response("400 Bad Request", "missing `conversationId`")
+                    conversation_http_error_response("missing `conversationId`")
                 } else {
                     match serde_json::from_slice::<HttpConversationMessageRequest>(&body) {
                         Ok(request) => {
                             match handle_http_conversation_message(&state, &conversation_id, request)
                                 .await
                             {
-                                Ok(result) => http_json_response("200 OK", result),
-                                Err(err) if err == "conversation not found" => {
-                                    http_error_response("404 Not Found", &err)
+                                Ok(result) => {
+                                    http_api_success_response("202 Accepted", result, None)
                                 }
-                                Err(err) => http_error_response("400 Bad Request", &err),
+                                Err(err) => conversation_http_error_response(&err),
                             }
                         }
-                        Err(err) => http_error_response("400 Bad Request", &err.to_string()),
+                        Err(err) => {
+                            http_api_error_response("400 Bad Request", "invalid_json", &err.to_string())
+                        }
                     }
                 }
             } else if method == "GET"
@@ -3455,26 +4363,37 @@ async fn handle_http_request(
                     .trim_end_matches('/')
                     .to_string();
                 if conversation_id.is_empty() {
-                    http_error_response("400 Bad Request", "missing `conversationId`")
+                    conversation_http_error_response("missing `conversationId`")
                 } else {
                     match state.read_conversation_messages(&conversation_id).await {
-                        Ok(result) => http_json_response("200 OK", result),
-                        Err(err) if err == "conversation not found" => {
-                            http_error_response("404 Not Found", &err)
+                        Ok(result) => {
+                            let count = result
+                                .get("messages")
+                                .and_then(Value::as_array)
+                                .map_or(0, |items| items.len());
+                            http_api_success_response(
+                                "200 OK",
+                                result,
+                                Some(json!({ "count": count })),
+                            )
                         }
-                        Err(err) => http_error_response("400 Bad Request", &err),
+                        Err(err) => conversation_http_error_response(&err),
                     }
                 }
             } else if method == "GET" && path.starts_with("/api/v1/conversations/") {
                 let trimmed = path.trim_start_matches("/api/v1/conversations/").trim_matches('/');
                 if trimmed.is_empty() || trimmed.contains('/') {
-                    http_error_response("404 Not Found", "not found")
+                    http_api_error_response("404 Not Found", "not_found", "not found")
                 } else {
                     match state.get_conversation(trimmed).await {
                         Some(conversation) => {
-                            http_json_response("200 OK", json!({ "conversation": conversation }))
+                            http_api_success_response(
+                                "200 OK",
+                                json!({ "conversation": conversation }),
+                                None,
+                            )
                         }
-                        None => http_error_response("404 Not Found", "conversation not found"),
+                        None => conversation_http_error_response("conversation not found"),
                     }
                 }
             } else if method == "GET" && path == "/api/threads" {
@@ -3652,10 +4571,13 @@ mod tests {
             conversations: Mutex::new(HashMap::new()),
             tasks_path: data_dir.join("service_tasks.json"),
             conversations_path: data_dir.join("service_conversations.json"),
+            mysql_retry_path: data_dir.join("service_mysql_retry.json"),
             storage_path: data_dir.join("workspaces.json"),
             settings_path: data_dir.join("settings.json"),
             app_settings: Mutex::new(AppSettings::default()),
             mysql_history: None,
+            mysql_retry_queue: Mutex::new(HashMap::new()),
+            mysql_retry_flush_lock: Mutex::new(()),
             event_sink: DaemonEventSink { tx },
             codex_login_cancels: Mutex::new(HashMap::new()),
             daemon_binary_path: Some("/tmp/codex-monitor-daemon".to_string()),
@@ -3790,6 +4712,142 @@ mod tests {
     }
 
     #[test]
+    fn build_insert_message_sql_is_idempotent() {
+        let sql = build_insert_message_sql(
+            "conv-1",
+            "thread-1",
+            Some("turn-1"),
+            "assistant",
+            "item/completed",
+            "hello",
+            Some("{\"ok\":true}"),
+            1001,
+        );
+
+        assert!(sql.contains("INSERT INTO conversation_message"));
+        assert!(sql.contains("FROM DUAL WHERE NOT EXISTS"));
+        assert!(sql.contains("conversation_id = 'conv-1'"));
+        assert!(sql.contains("thread_id = 'thread-1'"));
+        assert!(sql.contains("((turn_id = 'turn-1') OR (turn_id IS NULL AND 'turn-1' IS NULL))"));
+        assert!(sql.contains("((payload_json = '{\"ok\":true}') OR (payload_json IS NULL AND '{\"ok\":true}' IS NULL))"));
+    }
+
+    #[test]
+    fn build_insert_event_sql_is_idempotent() {
+        let sql = build_insert_event_sql(
+            "conv-1",
+            "thread-1",
+            None,
+            "turn/completed",
+            Some("completed"),
+            "{\"ok\":true}",
+            1002,
+        );
+
+        assert!(sql.contains("INSERT INTO conversation_event"));
+        assert!(sql.contains("FROM DUAL WHERE NOT EXISTS"));
+        assert!(sql.contains("conversation_id = 'conv-1'"));
+        assert!(sql.contains("thread_id = 'thread-1'"));
+        assert!(sql.contains("((turn_id = NULL) OR (turn_id IS NULL AND NULL IS NULL))"));
+        assert!(sql.contains("((event_status = 'completed') OR (event_status IS NULL AND 'completed' IS NULL))"));
+        assert!(sql.contains("payload_json = '{\"ok\":true}'"));
+    }
+
+    #[test]
+    fn build_upsert_task_sql_uses_numeric_bool_for_created_thread() {
+        let task = ServiceTaskRecord {
+            task_id: "task-1".to_string(),
+            status: "accepted".to_string(),
+            workspace_id: "ws-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            created_thread: true,
+            submitted_at_ms: 1001,
+            completed_at_ms: None,
+            last_error: None,
+        };
+
+        let sql = build_upsert_task_sql("conv-1", &task);
+
+        assert!(sql.contains("created_thread"));
+        assert!(sql.contains(", 1, 1001, NULL, NULL)"));
+        assert!(!sql.contains("'true'"));
+        assert!(!sql.contains("'false'"));
+    }
+
+    #[test]
+    fn collect_history_backfill_messages_reads_normalized_thread_items() {
+        let messages = collect_history_backfill_messages(json!({
+            "items": [
+                {
+                    "id": "msg-1",
+                    "type": "user",
+                    "text": "hello",
+                    "turnId": "turn-1",
+                    "timestamp": "2026-07-08T09:43:17.110Z"
+                },
+                {
+                    "id": "msg-2",
+                    "type": "assistant",
+                    "text": "world",
+                    "turnId": "turn-1",
+                    "phase": "final_answer",
+                    "timestamp": "2026-07-08T09:43:17.246Z"
+                }
+            ]
+        }));
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].message_type, "message");
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(messages[0].created_at_ms, 1751967797110);
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].message_type, "final_answer");
+        assert_eq!(messages[1].content, "world");
+    }
+
+    #[test]
+    fn resolve_conversation_id_from_records_prefers_latest_snapshot() {
+        let conversations = vec![
+            ServiceConversationRecord {
+                conversation_id: "conv-old".to_string(),
+                workspace_id: "ws-1".to_string(),
+                thread_id: "thread-1".to_string(),
+                title: "Old".to_string(),
+                requirement: "Old".to_string(),
+                status: "running".to_string(),
+                operator: None,
+                created_at_ms: 1,
+                updated_at_ms: 10,
+                last_message_preview: None,
+                final_summary: None,
+                last_error: None,
+            },
+            ServiceConversationRecord {
+                conversation_id: "conv-new".to_string(),
+                workspace_id: "ws-1".to_string(),
+                thread_id: "thread-1".to_string(),
+                title: "New".to_string(),
+                requirement: "New".to_string(),
+                status: "completed".to_string(),
+                operator: None,
+                created_at_ms: 2,
+                updated_at_ms: 20,
+                last_message_preview: None,
+                final_summary: None,
+                last_error: None,
+            },
+        ];
+
+        let resolved =
+            resolve_conversation_id_from_records(&conversations, "ws-1", "thread-1");
+
+        assert_eq!(resolved.as_deref(), Some("conv-new"));
+    }
+
+    #[test]
     fn mysql_history_writer_persists_rows_when_local_mysql_is_available() {
         run_async_test(async {
             let writer = MySqlHistoryWriter {
@@ -3872,6 +4930,19 @@ mod tests {
                 .await
                 .expect("persist message");
             writer
+                .insert_message(
+                    &conversation_id,
+                    &thread_id,
+                    Some(&turn_id),
+                    "user",
+                    "message",
+                    "hello mysql",
+                    Some("{\"ok\":true}"),
+                    1999,
+                )
+                .await
+                .expect("dedupe message");
+            writer
                 .insert_event(
                     &conversation_id,
                     &thread_id,
@@ -3883,6 +4954,18 @@ mod tests {
                 )
                 .await
                 .expect("persist event");
+            writer
+                .insert_event(
+                    &conversation_id,
+                    &thread_id,
+                    Some(&turn_id),
+                    "http/message",
+                    Some("accepted"),
+                    "{\"ok\":true}",
+                    2999,
+                )
+                .await
+                .expect("dedupe event");
 
             let verify_sql = format!(
                 "SELECT \
@@ -4216,7 +5299,7 @@ mod tests {
     }
 
     #[test]
-    fn http_conversation_list_returns_items_and_conversations() {
+    fn http_conversation_list_returns_stable_envelope() {
         run_async_test(async {
             let tmp = make_temp_dir("http-conversation-list-shape");
             let state = Arc::new(test_state(&tmp));
@@ -4251,9 +5334,12 @@ mod tests {
             .await;
 
             assert!(response.starts_with("HTTP/1.1 200 OK"));
+            assert!(response.contains("\"ok\":true"));
+            assert!(response.contains("\"data\":{\"items\":["));
+            assert!(response.contains("\"meta\":{\"count\":1}"));
             assert!(response.contains("\"items\":["));
-            assert!(response.contains("\"conversations\":["));
             assert!(response.contains("\"conversationId\":\"conv-1\""));
+            assert!(!response.contains("\"conversations\":["));
             let _ = std::fs::remove_dir_all(&tmp);
         });
     }
@@ -4316,10 +5402,10 @@ mod tests {
             let response = run_http_request(Arc::clone(&state), Arc::clone(&config), &request).await;
             response_task.await.expect("join mocked response task");
 
-            assert!(response.starts_with("HTTP/1.1 200 OK"));
-            assert!(response.contains("\"workspaceId\":\"ws-http\""));
-            assert!(response.contains("\"threadId\":\"thread-http\""));
-            assert!(response.contains("\"status\":\"accepted\""));
+            assert!(response.starts_with("HTTP/1.1 202 Accepted"));
+            assert!(response.contains("\"ok\":true"));
+            assert!(response.contains("\"conversationId\":\""));
+            assert!(response.contains("\"taskId\":\""));
 
             let response_body = response
                 .split("\r\n\r\n")
@@ -4327,11 +5413,15 @@ mod tests {
                 .expect("http body present");
             let parsed: Value = serde_json::from_str(response_body).expect("valid json body");
             let conversation_id = parsed
-                .get("conversationId")
+                .get("data")
+                .and_then(|data| data.get("conversation"))
+                .and_then(|conversation| conversation.get("conversationId"))
                 .and_then(Value::as_str)
                 .expect("conversation id");
             let task_id = parsed
-                .get("taskId")
+                .get("data")
+                .and_then(|data| data.get("task"))
+                .and_then(|task| task.get("taskId"))
                 .and_then(Value::as_str)
                 .expect("task id");
 
@@ -4356,6 +5446,8 @@ mod tests {
             );
             let detail_response = run_http_request(Arc::clone(&state), config, &detail_request).await;
             assert!(detail_response.starts_with("HTTP/1.1 200 OK"));
+            assert!(detail_response.contains("\"ok\":true"));
+            assert!(detail_response.contains("\"data\":{\"conversation\":{"));
             assert!(detail_response.contains(&format!("\"conversationId\":\"{conversation_id}\"")));
             assert!(detail_response.contains("\"threadId\":\"thread-http\""));
 
@@ -4433,10 +5525,10 @@ mod tests {
             let response = run_http_request(Arc::clone(&state), config, &request).await;
             response_task.await.expect("join mocked response task");
 
-            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            assert!(response.starts_with("HTTP/1.1 202 Accepted"));
+            assert!(response.contains("\"ok\":true"));
             assert!(response.contains("\"conversationId\":\"conv-1\""));
-            assert!(response.contains("\"threadId\":\"thread-http\""));
-            assert!(response.contains("\"status\":\"accepted\""));
+            assert!(response.contains("\"taskId\":\""));
 
             let response_body = response
                 .split("\r\n\r\n")
@@ -4444,7 +5536,9 @@ mod tests {
                 .expect("http body present");
             let parsed: Value = serde_json::from_str(response_body).expect("valid json body");
             let task_id = parsed
-                .get("taskId")
+                .get("data")
+                .and_then(|data| data.get("task"))
+                .and_then(|task| task.get("taskId"))
                 .and_then(Value::as_str)
                 .expect("task id");
 
@@ -4536,15 +5630,138 @@ mod tests {
             response_task.await.expect("join mocked response task");
 
             assert!(response.starts_with("HTTP/1.1 200 OK"));
-            assert!(response.contains("\"conversationId\":\"conv-1\""));
-            assert!(response.contains("\"workspaceId\":\"ws-http\""));
-            assert!(response.contains("\"threadId\":\"thread-http\""));
-            assert!(response.contains("\"messages\":{\"items\":[{\"id\":\"msg-1\""));
+            assert!(response.contains("\"ok\":true"));
+            assert!(response.contains("\"data\":{\"conversation\":{"));
+            assert!(response.contains("\"messages\":[{\"id\":\"msg-1\""));
+            assert!(response.contains("\"meta\":{\"count\":1}"));
 
             if let Some(session) = state.sessions.lock().await.remove("ws-http") {
                 let mut child = session.child.lock().await;
                 kill_child_process_tree(&mut child).await;
             }
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_conversation_messages_falls_back_to_session_jsonl() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-conversation-messages-jsonl");
+            let state = Arc::new(test_state(&tmp));
+            insert_workspace(&state, "ws-http", &tmp.join("workspace").to_string_lossy()).await;
+            state
+                .insert_conversation(ServiceConversationRecord {
+                    conversation_id: "conv-1".to_string(),
+                    workspace_id: "ws-http".to_string(),
+                    thread_id: "thread-http".to_string(),
+                    title: "Title".to_string(),
+                    requirement: "Requirement".to_string(),
+                    status: "completed".to_string(),
+                    operator: Some("tester".to_string()),
+                    created_at_ms: 1,
+                    updated_at_ms: 2,
+                    last_message_preview: Some("preview".to_string()),
+                    final_summary: Some("summary".to_string()),
+                    last_error: None,
+                })
+                .await;
+            let session = make_session(make_workspace_entry(
+                "ws-http",
+                &tmp.join("workspace").to_string_lossy(),
+            ));
+            state
+                .sessions
+                .lock()
+                .await
+                .insert("ws-http".to_string(), Arc::clone(&session));
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: None,
+                data_dir: tmp.clone(),
+            });
+            let session_path = tmp.join("session.jsonl");
+            std::fs::write(
+                &session_path,
+                concat!(
+                    "{\"timestamp\":\"2026-07-08T09:43:16.970Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+                    "{\"timestamp\":\"2026-07-08T09:43:17.110Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}],\"internal_chat_message_metadata_passthrough\":{\"turn_id\":\"turn-1\"}}}\n",
+                    "{\"timestamp\":\"2026-07-08T09:43:17.246Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"world\"}],\"phase\":\"final_answer\",\"internal_chat_message_metadata_passthrough\":{\"turn_id\":\"turn-1\"}}}\n",
+                    "{\"timestamp\":\"2026-07-08T09:43:17.300Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"ignore me\"}]}}\n"
+                ),
+            )
+            .expect("write session jsonl");
+
+            let session_for_response = Arc::clone(&session);
+            let session_path_string = session_path.to_string_lossy().to_string();
+            let response_task = tokio::spawn(async move {
+                loop {
+                    if let Some(tx) = session_for_response.pending.lock().await.remove(&0) {
+                        tx.send(json!({
+                            "result": {
+                                "thread": {
+                                    "id": "thread-http",
+                                    "path": session_path_string,
+                                    "turns": []
+                                }
+                            }
+                        }))
+                        .expect("send mocked daemon response");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+
+            let response = run_http_request(
+                Arc::clone(&state),
+                config,
+                "GET /api/v1/conversations/conv-1/messages HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await;
+            response_task.await.expect("join mocked response task");
+
+            assert!(response.starts_with("HTTP/1.1 200 OK"));
+            assert!(response.contains("\"ok\":true"));
+            assert!(response.contains("\"messages\":["));
+            assert!(response.contains("\"type\":\"user\""));
+            assert!(response.contains("\"text\":\"hello\""));
+            assert!(response.contains("\"type\":\"assistant\""));
+            assert!(response.contains("\"text\":\"world\""));
+            assert!(response.contains("\"meta\":{\"count\":2}"));
+            assert!(!response.contains("ignore me"));
+
+            if let Some(session) = state.sessions.lock().await.remove("ws-http") {
+                let mut child = session.child.lock().await;
+                kill_child_process_tree(&mut child).await;
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn http_conversation_missing_returns_stable_error_shape() {
+        run_async_test(async {
+            let tmp = make_temp_dir("http-conversation-missing");
+            let state = Arc::new(test_state(&tmp));
+            let config = Arc::new(DaemonConfig {
+                listen: "127.0.0.1:0".parse().expect("listen addr"),
+                http_listen: None,
+                token: None,
+                data_dir: tmp.clone(),
+            });
+
+            let response = run_http_request(
+                state,
+                config,
+                "GET /api/v1/conversations/missing HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await;
+
+            assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+            assert!(response.contains("\"ok\":false"));
+            assert!(response.contains("\"code\":\"conversation_not_found\""));
+            assert!(response.contains("\"message\":\"conversation not found\""));
             let _ = std::fs::remove_dir_all(&tmp);
         });
     }
@@ -4681,6 +5898,68 @@ mod tests {
         );
 
         assert_eq!(status.as_deref(), Some("waiting_approval"));
+    }
+
+    #[test]
+    fn conversation_status_maps_item_started_event() {
+        let status = map_conversation_status(
+            "item/started",
+            &json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "id": "item-1",
+                        "type": "agentMessage",
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(status.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn conversation_status_maps_streaming_delta_event() {
+        let status = map_conversation_status(
+            "item/agentMessage/delta",
+            &json!({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-1",
+                    "delta": "hello",
+                }
+            }),
+        );
+
+        assert_eq!(status.as_deref(), Some("streaming"));
+    }
+
+    #[test]
+    fn conversation_status_maps_thread_status_changed_event() {
+        let running = map_conversation_status(
+            "thread/status/changed",
+            &json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": "thread-1",
+                    "status": { "type": "active" }
+                }
+            }),
+        );
+        let failed = map_conversation_status(
+            "thread/status/changed",
+            &json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": "thread-1",
+                    "status": { "type": "systemError" }
+                }
+            }),
+        );
+
+        assert_eq!(running.as_deref(), Some("running"));
+        assert_eq!(failed.as_deref(), Some("failed"));
     }
 
     #[test]
@@ -5029,6 +6308,66 @@ mod tests {
             let _ = std::fs::remove_dir_all(&tmp);
         });
     }
+
+    #[test]
+    fn pending_mysql_writes_roundtrip() {
+        let tmp = make_temp_dir("mysql-retry-roundtrip");
+        let path = tmp.join("service_mysql_retry.json");
+        let mut writes = HashMap::new();
+        writes.insert(
+            "message:0001".to_string(),
+            PendingMySqlWrite {
+                key: "message:0001".to_string(),
+                kind: "message".to_string(),
+                sql: "INSERT INTO conversation_message VALUES (1)".to_string(),
+                created_at_ms: 100,
+                updated_at_ms: 200,
+                attempt_count: 3,
+                last_error: Some("mysql down".to_string()),
+            },
+        );
+
+        write_pending_mysql_writes(&path, &writes).expect("write retry queue");
+        let loaded = load_pending_mysql_writes(&path);
+        let record = loaded.get("message:0001").expect("loaded retry record");
+        assert_eq!(record.kind, "message");
+        assert_eq!(record.attempt_count, 3);
+        assert_eq!(record.last_error.as_deref(), Some("mysql down"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn enqueue_mysql_retry_overwrites_and_increments_attempts() {
+        run_async_test(async {
+            let tmp = make_temp_dir("mysql-retry-enqueue");
+            let state = test_state(&tmp);
+            state
+                .enqueue_mysql_retry(
+                    "message:0001".to_string(),
+                    "message",
+                    "INSERT INTO a VALUES (1)".to_string(),
+                    "first".to_string(),
+                )
+                .await;
+            state
+                .enqueue_mysql_retry(
+                    "message:0001".to_string(),
+                    "message",
+                    "INSERT INTO a VALUES (2)".to_string(),
+                    "second".to_string(),
+                )
+                .await;
+
+            let queue = state.mysql_retry_queue.lock().await;
+            let record = queue.get("message:0001").expect("retry record");
+            assert_eq!(record.sql, "INSERT INTO a VALUES (2)");
+            assert_eq!(record.attempt_count, 2);
+            assert_eq!(record.last_error.as_deref(), Some("second"));
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
 }
 
 fn main() {
@@ -5051,7 +6390,10 @@ fn main() {
             tx: events_tx.clone(),
         };
         let state = Arc::new(DaemonState::load(&config, event_sink));
+        state.reconcile_history_projection().await;
+        state.flush_mysql_retry_queue().await;
         let config = Arc::new(config);
+        tokio::spawn(Arc::clone(&state).run_mysql_retry_worker());
         tokio::spawn(forward_task_state_updates(
             Arc::clone(&state),
             events_tx.subscribe(),

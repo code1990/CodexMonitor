@@ -73,13 +73,71 @@ with HTTP status `401 Unauthorized`.
 
 ## Response Shape
 
-Current `v1` routes do not yet use a single universal envelope. In practice:
+Current `v1` routes are split into two styles:
 
-- health returns `{ "ok": true, ... }`
-- task create/read returns `{ "task": { ... } }`
-- errors return `{ "error": "<message>" }`
+- legacy infra routes such as health/tasks keep their historical shape
+- conversation routes under `/api/v1/conversations*` now use a stable envelope
 
-Do not assume future routes will keep every legacy detail unchanged.
+Stable conversation success shape:
+
+```json
+{
+  "ok": true,
+  "data": {},
+  "meta": {}
+}
+```
+
+Stable conversation error shape:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "conversation_not_found",
+    "message": "conversation not found"
+  }
+}
+```
+
+Conversation clients should branch on `error.code`, not on free-form message text.
+
+## Persistence Roles
+
+Current service-mode persistence is intentionally split.
+
+Decision for the current v1:
+
+- MySQL is not the daemon's primary fact store yet
+- local JSON remains the authoritative restart snapshot for `conversation` and `conversation_task`
+- the MySQL `conversation*` tables are the external history/read-side store consumed by FastAPI/Web
+
+This means the existence of the MySQL schema does not by itself make MySQL the daemon bootstrap source.
+
+- local JSON under `<data-dir>/service_tasks.json` and `<data-dir>/service_conversations.json` is the daemon's authoritative restart snapshot
+- MySQL is the external historical projection used for cross-process reads such as FastAPI/Web history queries
+
+Write order and compensation rules:
+
+- task/conversation state changes update in-memory state first, then rewrite the local JSON snapshot, then best-effort upsert to MySQL
+- daemon startup replays the current JSON snapshot back into MySQL for `conversation` and `conversation_task`
+- `conversation_message` and `conversation_event` are written directly to MySQL and are idempotent
+- `POST /api/v1/history/backfill` can import historical `conversation_message` rows from existing daemon-local thread/session data
+- `conversation_event` still has no full historical replay guarantee from local state in the current v1 design
+
+This means:
+
+- daemon liveness and restart recovery depend on local JSON, not on MySQL
+- external historical reads should treat MySQL as the source
+- if MySQL is temporarily unavailable, conversation/task snapshot state will be backfilled on the next successful startup
+- message history can be manually backfilled later with `POST /api/v1/history/backfill`
+- event gaps during the outage are still not fully replayed in the current v1 design
+
+MySQL should only be called the primary fact store after all of the following exist in code:
+
+- daemon startup loads `conversation` and `conversation_task` from MySQL rather than JSON
+- daemon writes treat MySQL success as the durable commit point
+- message/event recovery semantics are explicit for MySQL outages
 
 ## Task Model
 
@@ -114,9 +172,13 @@ Current statuses:
 
 Status transitions are driven from daemon-side app-server events:
 
-- `turn/started` -> `running`
+- `thread/started` -> `thread_created`
+- `turn/started`, `item/started`, and `thread/status/changed(active)` -> `running`
+- delta/update events such as `item/agentMessage/delta`, `item/reasoning/textDelta`, `turn/diff/updated`, and `turn/plan/updated` -> `streaming`
+- `item/tool/requestUserInput` -> `waiting_input`
+- `*requestApproval` -> `waiting_approval`
 - `turn/completed` -> `completed`
-- `error` or `turn/error` -> `failed`
+- `error`, `turn/error`, or `thread/status/changed(systemError)` -> `failed`
 
 If the daemon restarts before a task finishes, persisted in-flight tasks are reloaded as `failed` with:
 
@@ -177,6 +239,40 @@ Notes:
 
 - legacy `GET /health` also exists
 - `binaryPath` may be `null` in some environments
+
+## Conversation Model
+
+Conversation routes are the stable outward-facing HTTP API for Codex-backed development requests.
+
+Current conversation fields:
+
+```json
+{
+  "conversationId": "conv-123",
+  "workspaceId": "ws-http",
+  "threadId": "thread-http",
+  "title": "Fix login redirect",
+  "requirement": "Inspect the repo and fix the redirect bug.",
+  "status": "running",
+  "operator": "alice",
+  "createdAtMs": 1760000000000,
+  "updatedAtMs": 1760000001234,
+  "lastMessagePreview": "Inspect the repo and fix the redirect bug.",
+  "finalSummary": null,
+  "lastError": null
+}
+```
+
+Current conversation statuses:
+
+- `accepted`
+- `thread_created`
+- `running`
+- `streaming`
+- `waiting_input`
+- `waiting_approval`
+- `completed`
+- `failed`
 
 ### `POST /api/v1/tasks`
 
@@ -283,6 +379,177 @@ If the task does not exist:
 ```
 
 with HTTP status `404 Not Found`.
+
+### `POST /api/v1/conversations/start`
+
+Creates a new conversation, creates a thread, submits the first requirement, and returns the persisted conversation plus the accepted task.
+
+Request body:
+
+```json
+{
+  "workspaceId": "ws-http",
+  "title": "HTTP conversation smoke test",
+  "requirement": "Inspect the repository and report one concise summary.",
+  "operator": "curl-test",
+  "model": null,
+  "effort": null,
+  "serviceTier": null,
+  "accessMode": "full-access",
+  "images": null,
+  "appMentions": null,
+  "collaborationMode": null,
+  "codexProfile": null,
+  "defaultPromptTemplate": null
+}
+```
+
+Success response:
+
+- HTTP `202 Accepted`
+
+```json
+{
+  "ok": true,
+  "data": {
+    "conversation": {
+      "conversationId": "conv-123",
+      "workspaceId": "ws-http",
+      "threadId": "thread-http",
+      "title": "HTTP conversation smoke test",
+      "requirement": "Inspect the repository and report one concise summary.",
+      "status": "thread_created"
+    },
+    "task": {
+      "taskId": "task-123",
+      "status": "running",
+      "workspaceId": "ws-http",
+      "threadId": "thread-http",
+      "turnId": "turn-1",
+      "createdThread": true
+    }
+  }
+}
+```
+
+Stable error codes currently used by conversation routes:
+
+- `invalid_json`
+- `missing_title`
+- `missing_requirement`
+- `missing_text`
+- `missing_conversation_id`
+- `conversation_not_found`
+- `workspace_not_found`
+- `workspace_not_connected`
+- `upstream_protocol_error`
+- `internal_error`
+
+### `GET /api/v1/conversations`
+
+Returns persisted conversations, optionally filtered by `workspaceId`.
+
+Example response:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "items": [
+      {
+        "conversationId": "conv-123",
+        "workspaceId": "ws-http",
+        "threadId": "thread-http",
+        "title": "HTTP conversation smoke test",
+        "status": "completed"
+      }
+    ]
+  },
+  "meta": {
+    "count": 1
+  }
+}
+```
+
+### `GET /api/v1/conversations/{conversationId}`
+
+Returns one persisted conversation.
+
+Example response:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "conversation": {
+      "conversationId": "conv-123",
+      "workspaceId": "ws-http",
+      "threadId": "thread-http",
+      "status": "running"
+    }
+  }
+}
+```
+
+### `GET /api/v1/conversations/{conversationId}/messages`
+
+Returns the persisted conversation plus normalized thread messages.
+
+Example response:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "conversation": {
+      "conversationId": "conv-123",
+      "workspaceId": "ws-http",
+      "threadId": "thread-http"
+    },
+    "messages": [
+      {
+        "id": "msg-1",
+        "type": "user",
+        "text": "hello"
+      }
+    ]
+  },
+  "meta": {
+    "count": 1
+  }
+}
+```
+
+### `POST /api/v1/conversations/{conversationId}/messages`
+
+Appends a follow-up message to an existing conversation and returns the refreshed conversation plus the accepted task.
+
+Success response:
+
+- HTTP `202 Accepted`
+
+```json
+{
+  "ok": true,
+  "data": {
+    "conversation": {
+      "conversationId": "conv-123",
+      "workspaceId": "ws-http",
+      "threadId": "thread-http",
+      "status": "accepted",
+      "lastMessagePreview": "Continue and provide the final answer in 3 lines."
+    },
+    "task": {
+      "taskId": "task-456",
+      "status": "running",
+      "workspaceId": "ws-http",
+      "threadId": "thread-http",
+      "turnId": "turn-2",
+      "createdThread": false
+    }
+  }
+}
+```
 
 ### `GET /api/v1/tasks/{taskId}/events`
 

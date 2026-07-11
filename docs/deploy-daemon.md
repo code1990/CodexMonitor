@@ -7,6 +7,7 @@ Related API reference:
 - `docs/daemon-api-quickstart.md`
 - `docs/daemon-rpc-runbook.md`
 - `docs/daemon-service-api.md`
+- `../RuoYi-Vue3-FastAPI/ruoyi-fastapi-backend/docs/codex_conversation_migration.md`
 
 ## Goal
 
@@ -94,6 +95,7 @@ Recommended runtime layout:
   workspaces.json
   settings.json
   service_tasks.json
+  service_conversations.json
 ```
 
 Recommended release flow:
@@ -117,6 +119,11 @@ Example:
 ```
 
 Notes:
+
+- `service_tasks.json` and `service_conversations.json` are the daemon's local restart snapshot and remain required even when MySQL history projection is enabled.
+- MySQL should be treated as a downstream read model, not as the daemon bootstrap source in the current v1 implementation.
+- Put differently: the current daemon still boots from local JSON, so MySQL is not yet the primary fact store for conversation state.
+- To import historical thread messages from daemon-local session data into MySQL, call `POST /api/v1/history/backfill` after the daemon is up.
 
 - `--listen` is the internal TCP JSON-RPC port.
 - `--http-listen` is the HTTP/SSE port for web/mobile clients.

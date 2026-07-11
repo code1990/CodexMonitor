@@ -37,7 +37,7 @@
 
 - Test 1 或 Test 2 失败：先排查 daemon 是否启动成功、token 是否正确
 - Test 3 返回空 workspace：先准备 workspace
-- Test 9 返回 `workspace not connected`：先通过 RPC 或桌面端建立 workspace 会话
+- Test 9 返回 `code: workspace_not_connected`：先通过 RPC 或桌面端建立 workspace 会话
 
 ## 指令场景
 
@@ -254,7 +254,8 @@ curl -sS -H "Authorization: Bearer ${TOKEN}" \
 预期结果：
 
 - HTTP `200`
-- 返回 JSON 对象，且包含 `conversations`
+- 返回 JSON 对象，且包含 `ok: true`
+- 返回 JSON 对象，且包含 `data.items`
 
 ## Test 6：读取不存在的 Conversation
 
@@ -266,7 +267,7 @@ curl -i -H "Authorization: Bearer ${TOKEN}" \
 预期结果：
 
 - HTTP `404 Not Found`
-- 返回体包含 `"conversation not found"`
+- 返回体包含 `"code":"conversation_not_found"`
 
 ## Test 7：读取不存在 Conversation 的消息
 
@@ -317,15 +318,23 @@ curl -sS -H "Authorization: Bearer ${TOKEN}" \
 
 成功时预期结果：
 
-- JSON 中包含 `conversationId`
-- JSON 中包含 `workspaceId`
-- JSON 中包含 `threadId`
-- JSON 中包含 `taskId`
+- HTTP `202 Accepted`
+- JSON 中包含 `ok: true`
+- JSON 中包含 `data.conversation.conversationId`
+- JSON 中包含 `data.conversation.workspaceId`
+- JSON 中包含 `data.conversation.threadId`
+- JSON 中包含 `data.task.taskId`
 
 如果 workspace 未连接，当前分支上的典型失败返回为：
 
 ```json
-{"error":"workspace not connected"}
+{
+  "ok": false,
+  "error": {
+    "code": "workspace_not_connected",
+    "message": "workspace not connected"
+  }
+}
 ```
 
 ## Test 10：读取 Conversation 详情
@@ -339,9 +348,10 @@ curl -sS -H "Authorization: Bearer ${TOKEN}" \
 
 预期结果：
 
-- JSON 中包含 `conversation`
-- `conversation.conversationId` 与请求值一致
-- `conversation.status` 会随着执行过程变化，例如：
+- JSON 中包含 `ok: true`
+- JSON 中包含 `data.conversation`
+- `data.conversation.conversationId` 与请求值一致
+- `data.conversation.status` 会随着执行过程变化，例如：
   `accepted`、`streaming`、`completed`
 
 ## Test 11：读取 Conversation 消息
@@ -353,8 +363,9 @@ curl -sS -H "Authorization: Bearer ${TOKEN}" \
 
 预期结果：
 
-- JSON 中包含 `conversationId`
-- JSON 中包含 `messages`
+- JSON 中包含 `ok: true`
+- JSON 中包含 `data.conversation`
+- JSON 中包含 `data.messages`
 
 ## Test 12：发送 Follow-up 消息
 
@@ -367,8 +378,10 @@ curl -sS -H "Authorization: Bearer ${TOKEN}" \
 
 预期结果：
 
-- JSON 中包含 `taskId`
-- JSON 中包含 `threadId`
+- HTTP `202 Accepted`
+- JSON 中包含 `ok: true`
+- JSON 中包含 `data.task.taskId`
+- JSON 中包含 `data.task.threadId`
 
 ## Test 13：订阅 Conversation SSE
 
