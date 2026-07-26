@@ -161,11 +161,23 @@ export type DirectoryTextFileEntry = {
   content: string;
 };
 
+export type DirectoryFileEntry = Omit<DirectoryTextFileEntry, "content">;
+
 export async function listTextFilesInDirectory(
   directory: string,
   extensions: string[],
 ): Promise<DirectoryTextFileEntry[]> {
   return invoke("list_text_files_in_directory", {
+    directory: sanitizeExternalPath(directory),
+    extensions,
+  });
+}
+
+export async function listTextFileNamesInDirectory(
+  directory: string,
+  extensions: string[],
+): Promise<DirectoryFileEntry[]> {
+  return invoke("list_text_file_names_in_directory", {
     directory: sanitizeExternalPath(directory),
     extensions,
   });

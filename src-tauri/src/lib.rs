@@ -192,6 +192,7 @@ pub fn run() {
             files::move_text_file,
             files::read_text_file,
             files::list_text_files_in_directory,
+            files::list_text_file_names_in_directory,
             codex::get_config_model,
             menu::menu_set_accelerators,
             tray::set_tray_recent_threads,

@@ -31,6 +31,7 @@ type ComposerAutomationPanelProps = {
   onToggleAutoExportEnabled: (checked: boolean) => void;
   onOpenFilePicker: () => void;
   onOpenDirectoryPicker: () => void;
+  onStartEbookPrd: () => void;
   onOpenPromptFilePicker: () => void;
   onPickDownloadDirectory: () => void | Promise<void>;
   onFileChange: (event: ChangeEvent<HTMLInputElement>) => void | Promise<void>;
@@ -104,6 +105,7 @@ export function ComposerAutomationPanel({
   onToggleAutoExportEnabled,
   onOpenFilePicker,
   onOpenDirectoryPicker,
+  onStartEbookPrd,
   onOpenPromptFilePicker,
   onPickDownloadDirectory,
   onFileChange,
@@ -131,6 +133,9 @@ export function ComposerAutomationPanel({
         </button>
         <button type="button" className="ghost" onClick={onOpenDirectoryPicker}>
           MD Dir
+        </button>
+        <button type="button" className="ghost" onClick={onStartEbookPrd}>
+          Ebook PRD
         </button>
         <button type="button" className="ghost" onClick={onOpenPromptFilePicker}>
           Prompt TXT

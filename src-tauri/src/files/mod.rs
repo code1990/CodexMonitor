@@ -76,6 +76,13 @@ pub(crate) struct DirectoryTextFileEntry {
     pub content: String,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DirectoryFileEntry {
+    pub name: String,
+    pub path: String,
+}
+
 async fn file_read_impl(
     scope: FileScope,
     kind: FileKind,
@@ -281,6 +288,52 @@ pub(crate) fn list_text_files_in_directory(
         });
     }
 
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries)
+}
+
+#[tauri::command]
+pub(crate) fn list_text_file_names_in_directory(
+    directory: String,
+    extensions: Vec<String>,
+) -> Result<Vec<DirectoryFileEntry>, String> {
+    let sanitized_directory = sanitize_user_path(&directory);
+    let dir = PathBuf::from(&sanitized_directory);
+    if dir.as_os_str().is_empty() {
+        return Err("Directory is required".to_string());
+    }
+    if !dir.is_dir() {
+        return Err("Selected path is not a directory".to_string());
+    }
+    let allowed_extensions: Vec<String> = extensions
+        .into_iter()
+        .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|err| format!("Failed to list directory: {err}"))? {
+        let entry = entry.map_err(|err| format!("Failed to read directory entry: {err}"))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let extension = match path.extension().and_then(|value| value.to_str()) {
+            Some(value) => value.to_ascii_lowercase(),
+            None => continue,
+        };
+        if !allowed_extensions.is_empty() && !allowed_extensions.iter().any(|value| value == &extension) {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "Failed to read file name".to_string())?
+            .to_string();
+        entries.push(DirectoryFileEntry {
+            name,
+            path: path.to_string_lossy().to_string(),
+        });
+    }
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(entries)
 }

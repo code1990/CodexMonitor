@@ -18,6 +18,7 @@ const tauriMocks = vi.hoisted(() => ({
   pickTextFileMock: vi.fn(async () => null),
   readTextFileMock: vi.fn(async () => ""),
   listTextFilesInDirectoryMock: vi.fn(async () => []),
+  listTextFileNamesInDirectoryMock: vi.fn(async () => []),
   writeTextFileMock: vi.fn(async () => undefined),
   moveTextFileMock: vi.fn(async () => ""),
 }));
@@ -31,6 +32,7 @@ vi.mock("../../../services/tauri", () => ({
   pickTextFile: tauriMocks.pickTextFileMock,
   readTextFile: tauriMocks.readTextFileMock,
   listTextFilesInDirectory: tauriMocks.listTextFilesInDirectoryMock,
+  listTextFileNamesInDirectory: tauriMocks.listTextFileNamesInDirectoryMock,
   writeTextFile: tauriMocks.writeTextFileMock,
   moveTextFile: tauriMocks.moveTextFileMock,
 }));
@@ -123,12 +125,14 @@ describe("Composer send triggers", () => {
     tauriMocks.pickTextFileMock.mockReset();
     tauriMocks.readTextFileMock.mockReset();
     tauriMocks.listTextFilesInDirectoryMock.mockReset();
+    tauriMocks.listTextFileNamesInDirectoryMock.mockReset();
     tauriMocks.writeTextFileMock.mockReset();
     tauriMocks.moveTextFileMock.mockReset();
     tauriMocks.pickDirectoryMock.mockResolvedValue(null);
     tauriMocks.pickTextFileMock.mockResolvedValue(null);
     tauriMocks.readTextFileMock.mockResolvedValue("");
     tauriMocks.listTextFilesInDirectoryMock.mockResolvedValue([]);
+    tauriMocks.listTextFileNamesInDirectoryMock.mockResolvedValue([]);
     tauriMocks.writeTextFileMock.mockResolvedValue(undefined);
     tauriMocks.moveTextFileMock.mockResolvedValue("");
     vi.restoreAllMocks();

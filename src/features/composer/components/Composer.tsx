@@ -42,6 +42,7 @@ import { useComposerKeyDown } from "../hooks/useComposerKeyDown";
 import { useComposerSuggestionStyle } from "../hooks/useComposerSuggestionStyle";
 import { usePromptHistory } from "../hooks/usePromptHistory";
 import { useAutoTaskRunner } from "../hooks/useAutoTaskRunner";
+import { buildEbookPrdTasks } from "../utils/ebookPrdAutomation";
 import { ComposerAutomationPanel } from "./ComposerAutomationPanel";
 import { ComposerInput } from "./ComposerInput";
 import { ComposerMetaBar } from "./ComposerMetaBar";
@@ -51,6 +52,7 @@ import type { CodexArgsOption } from "../../threads/utils/codexArgsProfiles";
 import type { RuntimeAutomationController } from "@app/runtime/runtimeHost";
 import {
   listTextFilesInDirectory,
+  listTextFileNamesInDirectory,
   moveTextFile,
   pickDirectory,
   pickTextFile,
@@ -730,6 +732,47 @@ export const Composer = memo(function Composer({
     );
   }, [appendEffectiveTasks, setEffectiveAutomationEnabled]);
 
+  const handleEbookPrdAutomation = useCallback(async () => {
+    try {
+      const inputDirectory = await pickDirectory("Select ebook chapter directory");
+      if (!inputDirectory) {
+        return;
+      }
+      const promptPath = await pickTextFile("Select ebook PRD prompt", ["md", "txt"]);
+      if (!promptPath) {
+        return;
+      }
+      const outputDirectory = await pickDirectory("Select ebook PRD output directory");
+      if (!outputDirectory) {
+        return;
+      }
+      const [promptContent, chapterFiles] = await Promise.all([
+        readTextFile(promptPath),
+        listTextFileNamesInDirectory(inputDirectory, ["md"]),
+      ]);
+      const tasks = buildEbookPrdTasks({
+        inputDirectory,
+        outputDirectory,
+        chapters: chapterFiles.map(({ name, path }) => ({ name, path })),
+      });
+      const chapterDirectoryName = extractFileNameFromPath(inputDirectory);
+      setEffectiveAutomationEnabled(false);
+      clearEffectiveAutomationTasks();
+      applyAutomationPromptContent(extractFileNameFromPath(promptPath), promptContent);
+      appendEffectiveTasks(chapterDirectoryName, tasks);
+      setAutomationDirectorySourceName(inputDirectory);
+      setAutomationPauseSeconds(30);
+      setEffectiveAutomationEnabled(true);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "Failed to prepare ebook automation.");
+    }
+  }, [
+    appendEffectiveTasks,
+    applyAutomationPromptContent,
+    clearEffectiveAutomationTasks,
+    setEffectiveAutomationEnabled,
+  ]);
+
   const handleClearAutomation = useCallback(() => {
     setEffectiveAutomationEnabled(false);
     setEffectiveAutomationPromptEnabled(false);
@@ -1020,6 +1063,9 @@ export const Composer = memo(function Composer({
         onOpenFilePicker={() => automationFileInputRef.current?.click()}
         onOpenDirectoryPicker={() => {
           void handleAutomationDirectoryPick();
+        }}
+        onStartEbookPrd={() => {
+          void handleEbookPrdAutomation();
         }}
         onOpenPromptFilePicker={() => {
           void handleOpenAutomationPromptSource();
